@@ -7,14 +7,14 @@
 ## 安装
 
 ```bash
-go get github.com/yi-nology/ekit-timertask@v0.1.0
+go get github.com/openekit/timertask@v0.1.0
 ```
 
 ## 包清单
 
-- 根包 `timertask` — 基于 [ekit-concurrency](https://github.com/yi-nology/ekit-concurrency)、[ekit-logx](https://github.com/yi-nology/ekit-logx)
+- 根包 `timertask` — 基于 [ekit-concurrency](https://github.com/openekit/concurrency)、[ekit-logx](https://github.com/openekit/logx)
 
-依赖：[ekit-concurrency](https://github.com/yi-nology/ekit-concurrency)（async）、[ekit-logx](https://github.com/yi-nology/ekit-logx)。
+依赖：[ekit-concurrency](https://github.com/openekit/concurrency)（async）、[ekit-logx](https://github.com/openekit/logx)。
 
 ## License
 

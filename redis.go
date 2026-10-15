@@ -10,9 +10,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/openekit/concurrency/async"
+	"github.com/openekit/logx"
 	"github.com/redis/go-redis/v9"
-	"github.com/yi-nology/ekit-concurrency/async"
-	"github.com/yi-nology/ekit-logx"
 )
 
 const (
