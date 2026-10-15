@@ -2,7 +2,7 @@
 
 > 定时任务微库——分片定时任务（FNV-1a hash、心跳续约）
 
-> 项目主页：**https://oekit.github.io/oekit/** · 名称由来：**O**pen **E**asy **Kit**（开源 · 易用 · 工具集合）
+> 项目主页：**https://oekit.github.io/** · 名称由来：**O**pen **E**asy **Kit**（开源 · 易用 · 工具集合）
 
 本仓库是 [ekit](https://git.enjoye.top/enjoydream/ekit) 拆分矩阵的成员（Round-4 微库化）。
 
