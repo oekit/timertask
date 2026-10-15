@@ -10,7 +10,7 @@
 ## 安装
 
 ```bash
-go get github.com/oekit/timertask@v0.1.3
+go get github.com/oekit/timertask@v0.1.4
 ```
 
 ## 能做什么
