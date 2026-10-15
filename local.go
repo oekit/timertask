@@ -6,7 +6,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/openekit/concurrency/async"
+	"github.com/oekit/concurrency/async"
 )
 
 // localTaskItem 本地任务条目（用于优先队列）。

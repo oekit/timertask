@@ -10,8 +10,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/openekit/concurrency/async"
-	"github.com/openekit/logx"
+	"github.com/oekit/concurrency/async"
+	"github.com/oekit/logx"
 	"github.com/redis/go-redis/v9"
 )
 

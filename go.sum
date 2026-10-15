@@ -10,10 +10,10 @@ github.com/cloudwego/hertz v0.10.6 h1:VXUO0RdycrYOv8x2JgbQCJh2ovTrkRM6tS4isHN9dw
 github.com/cloudwego/hertz v0.10.6/go.mod h1:9Kkpj+fpkWLaKEnoil1Mnp/oxWp9iYx/mUk+fViqQ3E=
 github.com/klauspost/cpuid/v2 v2.4.0 h1:S6Hrbc7+ywsr0r+RLapfGBHfyefhCTwEh3A0tV913Dw=
 github.com/klauspost/cpuid/v2 v2.4.0/go.mod h1:19jmZ9mjzoF//ddRSUsv0zfBTJWh3QJh9FNxZTMrGxU=
-github.com/openekit/concurrency v0.1.2 h1:2ckIX8I2xAQxF1GxzO4n2Zjw5k4iGxKQbXzt1HYD+E4=
-github.com/openekit/concurrency v0.1.2/go.mod h1:miW6eiN7UWKcw7fI+f3d3abeA7ETwlWm3IT8FZ6T+do=
-github.com/openekit/logx v0.1.5 h1:3TNotbsVhGdEZcmVG20QazKxz+yYZkST/u5sd2NwllE=
-github.com/openekit/logx v0.1.5/go.mod h1:0iu26D6bfDgtz6PydZgvCgTguUQgXb60DV2QJ7wMSvs=
+github.com/oekit/concurrency v0.1.3 h1:vcA00t8WK/tf6h/2w8Ehzw8rlckMn7z1niAKJFtpjOY=
+github.com/oekit/concurrency v0.1.3/go.mod h1:eLJf6lP2t4qc+0mao5dlqRgk8GUl3B+VbFX02z2p950=
+github.com/oekit/logx v0.1.6 h1:W1zKJnEm/u2gH0fabNDnEcgusp/j8BLvXAvy59UXqcs=
+github.com/oekit/logx v0.1.6/go.mod h1:K93VJ73M4b9Pc+GCpj0V1DsaLfDhidAokf/uWSNdiPs=
 github.com/redis/go-redis/v9 v9.23.0 h1:/TTVdJa8BRNsybwwGGnmiYktHNlUXtbOQxlWpHBPL3s=
 github.com/redis/go-redis/v9 v9.23.0/go.mod h1:EWP2UUk+XDaI1s5nQB5mablZN6vccXlmBQTyfnF87D0=
 github.com/stretchr/testify v1.12.1 h1:EuwCh5fleGS7H32xRwO3wRGT7DxrDhLAT6FF8MpWDWE=

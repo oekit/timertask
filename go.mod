@@ -1,11 +1,11 @@
-module github.com/openekit/timertask
+module github.com/oekit/timertask
 
 go 1.26.0
 
 require (
 	github.com/alicebob/miniredis/v2 v2.40.0
-	github.com/openekit/concurrency v0.1.2
-	github.com/openekit/logx v0.1.5
+	github.com/oekit/concurrency v0.1.3
+	github.com/oekit/logx v0.1.6
 	github.com/redis/go-redis/v9 v9.23.0
 )
 
