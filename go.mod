@@ -5,8 +5,8 @@ go 1.26.0
 require (
 	github.com/alicebob/miniredis/v2 v2.40.0
 	github.com/redis/go-redis/v9 v9.23.0
-	github.com/yi-nology/ekit-concurrency v0.1.0
-	github.com/yi-nology/ekit-logx v0.1.2
+	github.com/yi-nology/ekit-concurrency v0.1.1
+	github.com/yi-nology/ekit-logx v0.1.4
 )
 
 require (
