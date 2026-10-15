@@ -13,19 +13,33 @@
 go get github.com/oekit/timertask@v0.1.3
 ```
 
-## 快速使用
+## 能做什么
 
+- **双后端**：LocalBackend（单机内存）/ RedisBackend（跨实例分片）
+- **分片协调**：ShardManager 心跳 + FNV-1a 均匀分片，多实例不重不漏
+- **可靠性**：任务级重试（次数+延迟）、失败回调、桶/worker 可调
+
+## 使用示例
+
+### 本地延迟任务
 ```go
 import "github.com/oekit/timertask"
 
 var handler timertask.Handler = func(ctx context.Context, t *timertask.Task) error {
     return dispatch(t.Action, t.Param)
 }
-backend := timertask.NewLocalBackend(handler)
+backend := timertask.NewLocalBackend(handler,
+    timertask.WithRetry(3, 10*time.Second),
+    timertask.WithOnFailure(func(t *timertask.Task, err error) { alert(t) }))
 _ = backend.Start(ctx)
 _ = backend.Send(ctx, &timertask.Task{ID: "t1", EndTime: time.Now().Add(time.Minute).Unix(), Action: "remind"})
 ```
-
+### 跨实例分片（Redis）
+```go
+backend := timertask.NewRedisBackend("order", redisCli, handler)
+sm := timertask.NewShardManager("order", redisCli, 10) // 10 分片
+sm.StartHeartbeat(ctx)
+sm.StartAssign(ctx)
 ## 包清单
 
 - 根包 `timertask` — 基于 [ekit-concurrency](https://github.com/oekit/concurrency)、[ekit-logx](https://github.com/oekit/logx)
