@@ -93,12 +93,12 @@ type claim struct {
 func NewRedisBackend(buzType string, client redis.UniversalClient, handler Handler, opts ...TimerTaskOption) *RedisBackend {
 	cfg := applyOptions(opts)
 	b := &RedisBackend{
-		client:     client,
-		buzType:    buzType,
-		handler:    handler,
-		onFailure:  cfg.onFailure,
-		buckets:    cfg.buckets,
-		workers:    cfg.workers,
+		client:            client,
+		buzType:           buzType,
+		handler:           handler,
+		onFailure:         cfg.onFailure,
+		buckets:           cfg.buckets,
+		workers:           cfg.workers,
 		retryCount:        cfg.retryCount,
 		retryDelay:        cfg.retryDelay,
 		delivery:          cfg.delivery,
