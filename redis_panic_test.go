@@ -40,7 +40,7 @@ func TestRedisBackend_HandlerPanic_TreatedAsFailure(t *testing.T) {
 		workers:      cfg.workers,
 		retryCount:   cfg.retryCount,
 		retryDelay:   cfg.retryDelay,
-		localQueue:   make(chan *Task, 1000),
+		localQueue:   make(chan *claim, 1000),
 		stopChan:     make(chan struct{}),
 		shardManager: NewShardManager("test", c, cfg.buckets),
 	}
@@ -92,7 +92,7 @@ func TestRedisBackend_HandlerPanicAlways_DeadLetter(t *testing.T) {
 		workers:      cfg.workers,
 		retryCount:   cfg.retryCount,
 		retryDelay:   cfg.retryDelay,
-		localQueue:   make(chan *Task, 1000),
+		localQueue:   make(chan *claim, 1000),
 		stopChan:     make(chan struct{}),
 		shardManager: NewShardManager("test", c, cfg.buckets),
 	}
@@ -146,12 +146,12 @@ func TestRedisBackend_NegativeMaxRetry_Normalized(t *testing.T) {
 		workers:      cfg.workers,
 		retryCount:   cfg.retryCount,
 		retryDelay:   cfg.retryDelay,
-		localQueue:   make(chan *Task, 1000),
+		localQueue:   make(chan *claim, 1000),
 		stopChan:     make(chan struct{}),
 		shardManager: NewShardManager("test", c, cfg.buckets),
 	}
 
-	b.processTask(context.Background(), &Task{ID: "neg-1", MaxRetry: -1})
+	b.processTask(context.Background(), &claim{task: &Task{ID: "neg-1", MaxRetry: -1}})
 	if executed.Load() != 1 {
 		t.Fatalf("expected handler executed exactly once for negative MaxRetry, got %d", executed.Load())
 	}

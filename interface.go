@@ -59,13 +59,27 @@ type TimerTask interface {
 	LocalPendingCount() int
 }
 
+// DeliveryMode 是任务投递语义。
+type DeliveryMode int
+
+const (
+	// DeliveryAtMostOnce 默认：claim 时从 ZSet 原子删除后处理。
+	// 删除后、处理前崩溃 = 任务永久丢失（仅优雅停机回灌兜底）。
+	DeliveryAtMostOnce DeliveryMode = iota
+	// DeliveryAtLeastOnce 可靠模式：claim 时移入 processing 租约集，
+	// handler 成功后 Ack 删除；租约超时由回扫重投。可容忍重复，调用方幂等。
+	DeliveryAtLeastOnce
+)
+
 // config 是延迟任务的通用配置。
 type config struct {
-	workers    int
-	retryCount int
-	retryDelay time.Duration
-	buckets    int                // 仅 Redis 模式有效
-	onFailure  func(*Task, error) // 任务最终失败回调（通知用途；持久死信由 RedisBackend 自动写入）
+	workers           int
+	retryCount        int
+	retryDelay        time.Duration
+	buckets           int                // 仅 Redis 模式有效
+	onFailure         func(*Task, error) // 任务最终失败回调（通知用途；持久死信由 RedisBackend 自动写入）
+	delivery          DeliveryMode
+	visibilityTimeout time.Duration // 仅 DeliveryAtLeastOnce：processing 租约时长
 }
 
 // TimerTaskOption 配置延迟任务的可选参数（函数选项模式）。
@@ -113,13 +127,42 @@ func WithOnFailure(fn func(task *Task, err error)) TimerTaskOption {
 	}
 }
 
+// WithDeliveryMode 设置投递语义。默认 DeliveryAtMostOnce（与历史行为一致）。
+// DeliveryAtLeastOnce 时可用 WithVisibilityTimeout 调整租约时长。
+// 仅 RedisBackend 生效；LocalBackend 为纯内存，无持久投递语义。
+func WithDeliveryMode(m DeliveryMode) TimerTaskOption {
+	return func(c *config) { c.delivery = m }
+}
+
+// WithAtLeastOnce 开启可靠投递（等价 WithDeliveryMode(DeliveryAtLeastOnce)），
+// visibilityTimeout 为 processing 租约时长（<=0 取默认 60s）。
+// claim 后任务进入租约集，成功 Ack 删除；超时未 Ack 由回扫按 RetryCount 重投。
+func WithAtLeastOnce(visibilityTimeout time.Duration) TimerTaskOption {
+	return func(c *config) {
+		c.delivery = DeliveryAtLeastOnce
+		if visibilityTimeout > 0 {
+			c.visibilityTimeout = visibilityTimeout
+		}
+	}
+}
+
+// WithVisibilityTimeout 设置 at-least-once 模式的租约时长（<=0 取默认 60s）。
+func WithVisibilityTimeout(d time.Duration) TimerTaskOption {
+	return func(c *config) {
+		if d > 0 {
+			c.visibilityTimeout = d
+		}
+	}
+}
+
 // applyOptions 应用选项并返回配置。
 func applyOptions(opts []TimerTaskOption) config {
 	cfg := config{
-		workers:    defaultWorkers,
-		retryCount: defaultRetryCount,
-		retryDelay: defaultRetryDelay,
-		buckets:    defaultBuckets,
+		workers:           defaultWorkers,
+		retryCount:        defaultRetryCount,
+		retryDelay:        defaultRetryDelay,
+		buckets:           defaultBuckets,
+		visibilityTimeout: defaultVisibilityTimeout,
 	}
 	for _, opt := range opts {
 		opt(&cfg)

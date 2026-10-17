@@ -69,10 +69,20 @@ type RedisBackend struct {
 	// 分片管理
 	shardManager *ShardManager
 
-	// 本地队列
-	localQueue chan *Task
+	// 投递语义：DeliveryAtMostOnce（默认）或 DeliveryAtLeastOnce（租约+Ack）
+	delivery          DeliveryMode
+	visibilityTimeout time.Duration
+
+	// 本地队列：携带原始 ZSet member，可靠模式 Ack 时使用
+	localQueue chan *claim
 	stopChan   chan struct{}
 	stopOnce   sync.Once
+}
+
+// claim 是本地队列中的已 claim 任务，member 为 ZSet 原始成员串。
+type claim struct {
+	task   *Task
+	member string
 }
 
 // NewRedisBackend 创建基于 Redis 的延迟任务后端。
@@ -89,10 +99,12 @@ func NewRedisBackend(buzType string, client redis.UniversalClient, handler Handl
 		onFailure:  cfg.onFailure,
 		buckets:    cfg.buckets,
 		workers:    cfg.workers,
-		retryCount: cfg.retryCount,
-		retryDelay: cfg.retryDelay,
-		localQueue: make(chan *Task, 100000),
-		stopChan:   make(chan struct{}),
+		retryCount:        cfg.retryCount,
+		retryDelay:        cfg.retryDelay,
+		delivery:          cfg.delivery,
+		visibilityTimeout: cfg.visibilityTimeout,
+		localQueue:        make(chan *claim, 100000),
+		stopChan:          make(chan struct{}),
 	}
 
 	// 创建分片管理器
@@ -172,20 +184,26 @@ func (b *RedisBackend) requeuePendingOnShutdown() {
 					"requeued", requeued)
 			}
 			return
-		case task := <-b.localQueue:
-			if task == nil {
+		case c := <-b.localQueue:
+			if c == nil || c.task == nil {
 				continue
 			}
+			task := c.task
 			data, err := json.Marshal(task)
 			if err != nil {
 				log.Error("requeue marshal failed", "taskID", task.ID, "err", err)
 				continue
 			}
 			key := b.taskKey(task.ID)
-			if _, err := b.client.ZAdd(ctx, key, redis.Z{
+			pipe := b.client.Pipeline()
+			pipe.ZAdd(ctx, key, redis.Z{
 				Score:  float64(task.EndTime),
 				Member: string(data),
-			}).Result(); err != nil {
+			})
+			if b.delivery == DeliveryAtLeastOnce {
+				pipe.ZRem(ctx, b.processingKey(), c.member)
+			}
+			if _, err := pipe.Exec(ctx); err != nil {
 				log.Error("requeue ZAdd failed", "taskID", task.ID, "err", err)
 				continue
 			}
@@ -239,13 +257,20 @@ func (b *RedisBackend) consumeRemoteOnce(ctx context.Context) {
 		}
 
 		for _, data := range tasks {
-			// 使用 Lua 脚本原子删除（score 相同时才删除）
-			result, err := deleteScript.Run(ctx, b.client, []string{key}, data, now).Int()
+			var ok bool
+			var err error
+			if b.delivery == DeliveryAtLeastOnce {
+				ok, err = b.claimTaskWithLease(ctx, key, data, now)
+			} else {
+				var result int
+				result, err = deleteScript.Run(ctx, b.client, []string{key}, data, now).Int()
+				ok = result > 0
+			}
 			if err != nil {
-				log.Error("delete script error", "err", err)
+				log.Error("claim script error", "err", err)
 				continue
 			}
-			if result > 0 {
+			if ok {
 				task := b.parseTask(data)
 				if task == nil {
 					log.Error("failed to parse task from ZSet, data discarded", "key", key)
@@ -253,7 +278,7 @@ func (b *RedisBackend) consumeRemoteOnce(ctx context.Context) {
 				}
 				// 推入本地队列
 				select {
-				case b.localQueue <- task:
+				case b.localQueue <- &claim{task: task, member: data}:
 				case <-ctx.Done():
 					return
 				case <-b.stopChan:
@@ -272,19 +297,27 @@ func (b *RedisBackend) workerLoop(ctx context.Context) {
 			return
 		case <-b.stopChan:
 			return
-		case task := <-b.localQueue:
-			if task == nil {
+		case c := <-b.localQueue:
+			if c == nil || c.task == nil {
 				continue
 			}
-			b.processTask(ctx, task)
+			b.processTask(ctx, c)
 		}
 	}
 }
 
-// processTask 处理单个任务，支持重试。
-func (b *RedisBackend) processTask(ctx context.Context, task *Task) {
+// processTask 处理单个任务，支持重试。可靠模式下成功或终态失败会 Ack 租约。
+func (b *RedisBackend) processTask(ctx context.Context, c *claim) {
+	task := c.task
 	var err error
 	normalizeRetry(task)
+	defer func() {
+		if b.delivery == DeliveryAtLeastOnce {
+			// 成功或已进死信的终态：释放租约；仅 handler 仍在重试窗口内不 Ack。
+			// 本函数返回即终态（成功 return / 死信+onFailure）。
+			b.ackTask(context.Background(), c.member)
+		}
+	}()
 	// retryTimer lazy init: i=0 直接调 handler，不需要 timer；只有真正进入重试路径
 	// 才创建 timer，避免每次成功任务都起一个未消费的 timer（defer Stop 不会释放
 	// 已经被 runtime 调度过但未读取的 tick，长时间运行会累积）。

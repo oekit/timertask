@@ -28,7 +28,7 @@ func newTestRedisBackend(t *testing.T) (*RedisBackend, *miniredis.Miniredis) {
 		workers:      cfg.workers,
 		retryCount:   cfg.retryCount,
 		retryDelay:   cfg.retryDelay,
-		localQueue:   make(chan *Task, 1000),
+		localQueue:   make(chan *claim, 1000),
 		stopChan:     make(chan struct{}),
 		shardManager: NewShardManager("test", c, cfg.buckets),
 	}, mr
@@ -101,7 +101,7 @@ func TestRedisBackend_Send_SetsDefaults(t *testing.T) {
 		workers:      1,
 		retryCount:   3,
 		retryDelay:   time.Second,
-		localQueue:   make(chan *Task, 100),
+		localQueue:   make(chan *claim, 100),
 		stopChan:     make(chan struct{}),
 		shardManager: NewShardManager("test", c, 4),
 	}
@@ -159,7 +159,7 @@ func TestRedisBackend_LocalPendingCount(t *testing.T) {
 	}
 
 	task := &Task{ID: "local-1"}
-	b.localQueue <- task
+	b.localQueue <- &claim{task: task, member: mustJSON(task)}
 	if got := b.LocalPendingCount(); got != 1 {
 		t.Errorf("expected 1, got %d", got)
 	}
@@ -215,7 +215,7 @@ func TestRedisBackend_ConsumeRemoteOnce_PushToLocalQueue(t *testing.T) {
 		workers:      cfg.workers,
 		retryCount:   cfg.retryCount,
 		retryDelay:   cfg.retryDelay,
-		localQueue:   make(chan *Task, 100),
+		localQueue:   make(chan *claim, 100),
 		stopChan:     make(chan struct{}),
 		shardManager: NewShardManager("test", c, cfg.buckets),
 	}
@@ -243,8 +243,8 @@ func TestRedisBackend_ConsumeRemoteOnce_PushToLocalQueue(t *testing.T) {
 
 	select {
 	case got := <-b.localQueue:
-		if got.ID != "expired-1" {
-			t.Errorf("expected expired-1, got %q", got.ID)
+		if got.task.ID != "expired-1" {
+			t.Errorf("expected expired-1, got %q", got.task.ID)
 		}
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("expected task in localQueue within 500ms after consumeRemoteOnce")

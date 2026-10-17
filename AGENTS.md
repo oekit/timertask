@@ -1,7 +1,7 @@
 # AGENTS.md — oekit/timertask
 
 > 分片定时任务（LocalBackend / RedisBackend，FNV-1a 分片）
-> 当前版本：`v0.1.4` · module：`github.com/oekit/timertask` · org：[oekit = Open Easy Kit](https://oekit.github.io)
+> 当前版本：`v0.1.5` · module：`github.com/oekit/timertask` · org：[oekit = Open Easy Kit](https://oekit.github.io)
 
 ## 本仓包含
 `./`

@@ -71,7 +71,7 @@ func TestRedisBackend_DeadLetterOnFinalFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	b.processTask(ctx, task)
+	b.processTask(ctx, &claim{task: task})
 
 	dead := "{timertask." + b.buzType + "}.dead"
 	members, err := b.client.ZRange(ctx, dead, 0, -1).Result()
@@ -95,7 +95,7 @@ func TestRedisBackend_RequeueOnShutdown(t *testing.T) {
 	// 直接往本地队列塞一个未处理任务（已被 ZREM 的状态模拟）
 	endTime := time.Now().Add(time.Hour).Unix()
 	queued := &Task{ID: "requeue-1", EndTime: endTime, Action: "x"}
-	b.localQueue <- queued
+	b.localQueue <- &claim{task: queued}
 	if b.LocalPendingCount() != 1 {
 		t.Fatal("expected 1 pending local task")
 	}
