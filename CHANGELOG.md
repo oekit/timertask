@@ -3,6 +3,10 @@
 由 ekit v0.34.0（git.enjoye.top/enjoydream/ekit，冻结维护）拆分而来。所有 notable 变更记录如下。
 
 
+## [v0.1.6] — 2026-10-17
+
+- fix(deps): 内部依赖地板 concurrency v0.1.5 → v0.5.2、logx v0.1.9 → v0.5.0；go 最低版本降至 1.24.0——go-redis v9.22.0、x/sys v0.41.0 锁 go1.24 兼容版
+
 ## [Unreleased]
 
 - **feat(redis)**：可选 **at-least-once 可靠投递**（`WithAtLeastOnce(vis)` /
