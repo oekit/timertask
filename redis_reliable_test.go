@@ -72,7 +72,7 @@ func TestAtLeastOnce_LeaseExpireRequeue(t *testing.T) {
 
 	// 手动把租约拨成已过期，触发回扫重投
 	past := time.Now().Unix() - 10
-	if err := b.client.ZAdd(context.Background(), b.processingKey(), redis.Z{
+	if err = b.client.ZAdd(context.Background(), b.processingKey(), redis.Z{
 		Score:  float64(past),
 		Member: mustJSON(task),
 	}).Err(); err != nil {

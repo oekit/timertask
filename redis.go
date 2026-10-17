@@ -151,6 +151,11 @@ func (b *RedisBackend) Start(ctx context.Context) error {
 	// 启动远程队列消费
 	async.GoSafe(func() { b.consumeRemoteLoop(ctx) })
 
+	// at-least-once：启动租约回扫——崩溃实例未 Ack 的租约到期后由本循环捡回重投
+	if b.delivery == DeliveryAtLeastOnce {
+		async.GoSafe(func() { b.reapLoop(ctx) })
+	}
+
 	// 启动本地 Worker 池
 	for i := 0; i < b.workers; i++ {
 		async.GoSafe(func() { b.workerLoop(ctx) })
@@ -163,6 +168,10 @@ func (b *RedisBackend) Start(ctx context.Context) error {
 	// stopOnce 防二次 Start 重复 close panic（与 LocalBackend 对称）。
 	b.stopOnce.Do(func() { close(b.stopChan) })
 	b.requeuePendingOnShutdown()
+	// at-least-once：停机同步补一轮租约回扫（reapLoop 内也会做，这里兜底时序竞态）
+	if b.delivery == DeliveryAtLeastOnce {
+		b.requeueLeasesOnShutdown()
+	}
 	return ctx.Err()
 }
 
