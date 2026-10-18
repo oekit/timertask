@@ -1,7 +1,7 @@
 # AGENTS.md — oekit/timertask
 
 > 分片定时任务（FNV-1a、心跳续约）
-> 当前版本：`v0.1.7` · module：`github.com/oekit/timertask` · org：[oekit = Open Easy Kit](https://oekit.github.io)
+> 当前版本：`v0.1.9` · module：`github.com/oekit/timertask` · org：[oekit = Open Easy Kit](https://oekit.github.io)
 
 ## 本仓包含
 `./`
