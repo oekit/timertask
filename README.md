@@ -55,9 +55,32 @@ _ = sched.Schedule("0 3 * * *", func(ctx context.Context, at time.Time) error {
 _ = sched.Start(ctx)
 ```
 
+## 从 v0.1.x 迁移到 v0.2.0（Redis 后端迁嵌套模块）
+
+`github.com/oekit/timertask/redis` 是**独立的 Go module**（有自己的 go.mod 与 tag
+`redis/v0.2.0`），不是根包下的子目录——所以迁移要改**两处**：
+
+```bash
+go get github.com/oekit/timertask/redis@v0.2.0   # ① go.mod 新增 require（必需）
+```
+
+```go
+// ② import 路径
+import "github.com/oekit/timertask/redis"
+
+backend := redis.New(redis.RedisConfig{...})   // API 不变
+```
+
+只改 import 路径而漏掉 ①，会构建失败（`no required module provides package
+github.com/oekit/timertask/redis`）。
+
+**只用本地形态（LocalBackend）的消费方无需任何改动**——根包保留
+`Task`/`Handler`/全部 `With*` 选项与 `LocalBackend`，且根模块已剥离
+go-redis/logx/concurrency（`import timertask` 的模块依赖面只有 `github.com/oekit/pkg`）。
+
 ## 边界
 
-- 跨实例去重需要 Redis → 嵌套模块 `github.com/oekit/timertask/redis`；
+- 跨实例去重需要 Redis → 嵌套模块 `github.com/oekit/timertask/redis`（独立 module，需单独 require）；
   cron 表达式解析在 [pkg/timex/cron](https://github.com/oekit/pkg)（`local` 子包直接复用，不另写一份）
 
 

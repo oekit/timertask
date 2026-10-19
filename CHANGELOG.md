@@ -7,11 +7,36 @@
 - feat(redis): Redis 后端（分片 + 可靠投递）自根包迁入嵌套模块 `github.com/oekit/timertask/redis`
   ——根模块依赖面剥离 go-redis，Redis 形态独立成模块按需引入
 
+## [v0.2.1] — 2026-10-20
+
+### docs：修正 v0.2.0 的迁移措辞——「import 路径替换即可」不准确（#19）
+
+- v0.2.0 的 Breaking 段写「改用 `github.com/oekit/timertask/redis`（import 路径替换即可，API 不变）」
+  ——**这句是错的**：`timertask/redis` 不是根包下的子目录，它是**独立的 Go module**
+  （有自己的 go.mod、自己的 tag `redis/v0.2.0`）。消费方只改 import 路径、**不新增 require 行**，
+  会直接构建失败（`no required module provides package github.com/oekit/timertask/redis`）
+- 正确的迁移步骤（**新增 require 是必需的一步**）：
+
+  ```bash
+  go get github.com/oekit/timertask/redis@v0.2.0
+  ```
+
+  ```go
+  // 旧
+  backend := timertask.NewRedisBackend(timertask.RedisConfig{...})
+  // 新（import 路径 + go.mod require 两处都要改）
+  backend := redis.New(redis.RedisConfig{...})
+  ```
+
+- 仅文档修正，无代码变更
+
 ## [v0.2.0] — 2026-10-19
 
 ### Breaking
 - **Redis 后端迁至嵌套模块**：`RedisBackend`/`NewRedisBackend`/`ShardManager`/`NewShardManager`
-  从根包移除，改用 `github.com/oekit/timertask/redis`（import 路径替换即可，API 不变）；
+  从根包移除，改用 `github.com/oekit/timertask/redis`（**API 不变，但 import 路径与 go.mod
+  require 两处都要改**——`timertask/redis` 是**独立 module**，需 `go get
+  github.com/oekit/timertask/redis@v0.2.0` 新增 require 行；详见 v0.2.1 的迁移步骤）；
   根包保留 `Task`/`Handler`/全部 `With*` 选项，既有调用点一行不动
 - **根包不再依赖 `github.com/oekit/logx`**：日志改用标准库 `log/slog`（消费方经
   `slog.SetDefault` 汇流）；同时剥离 `github.com/oekit/concurrency`（`async.GoSafe` 改为包内等价实现）
