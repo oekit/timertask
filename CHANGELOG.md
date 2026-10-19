@@ -2,6 +2,10 @@
 
 由 ekit v0.34.0（git.enjoye.top/enjoydream/ekit，冻结维护）拆分而来。所有 notable 变更记录如下。
 
+## [redis/v0.2.1] — 2026-10-20
+
+- build: 父模块依赖地板 v0.2.0 → v0.2.1（跟随 timertask v0.2.1；父模块地板不得落后最新 tag）
+
 ## [redis/v0.2.0] — 2026-10-19
 
 - feat(redis): Redis 后端（分片 + 可靠投递）自根包迁入嵌套模块 `github.com/oekit/timertask/redis`
