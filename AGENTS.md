@@ -1,7 +1,7 @@
 # AGENTS.md — oekit/timertask
 
 > 分片定时任务（FNV-1a、心跳续约）；v0.1.5 起可选可靠投递 DeliveryAtLeastOnce（租约 + Ack + 可见性超时；过期租约回扫重投/死信、停机 best-effort 收租，v0.1.7 接入生命周期真正生效）
-> 当前版本：`v0.1.9` · module：`github.com/oekit/timertask` · org：[oekit = Open Easy Kit](https://oekit.github.io)
+> 当前版本：`v0.1.10` · module：`github.com/oekit/timertask` · org：[oekit = Open Easy Kit](https://oekit.github.io)
 
 ## 本仓包含
 `./`

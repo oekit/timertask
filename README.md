@@ -8,7 +8,7 @@
 ## 安装
 
 ```bash
-go get github.com/oekit/timertask@v0.1.9
+go get github.com/oekit/timertask@v0.1.10
 ```
 
 ## 这个仓库做什么
