@@ -6,6 +6,24 @@ import (
 	"time"
 )
 
+// 通用默认值。
+//
+// 这些常量原先定义在 redis.go / redis_reliable.go（Redis 后端专属文件）里，
+// 拆分出嵌套模块后必须上移到根包——选项函数（WithWorkers/WithRetry/…）留在
+// 根包，其默认值也必须留在根包。
+const (
+	// defaultWorkers 默认 worker 数量。
+	defaultWorkers = 10
+	// defaultRetryCount 默认重试次数。
+	defaultRetryCount = 3
+	// defaultRetryDelay 默认重试间隔。
+	defaultRetryDelay = 5 * time.Second
+	// defaultBuckets 默认分片桶数（仅 Redis 后端有效）。
+	defaultBuckets = 128
+	// defaultVisibilityTimeout 默认租约时长（仅 at-least-once 模式有效）。
+	defaultVisibilityTimeout = 60 * time.Second
+)
+
 // Task 是一个延迟任务。
 type Task struct {
 	ID         string `json:"task_id"`     // 任务唯一 ID
@@ -42,7 +60,9 @@ func normalizeRetry(task *Task) {
 }
 
 // TimerTask 是延迟任务队列接口。
-// 支持多种后端实现（Redis、本地内存等）。
+// 支持多种后端实现：
+//   - 本包 LocalBackend：基于内存的本地延迟任务（零第三方依赖，零 Redis）
+//   - github.com/oekit/timertask/redis：基于 Redis ZSet 的分布式延迟任务
 type TimerTask interface {
 	// Send 提交一个延迟任务。
 	// task.EndTime（Unix 秒）决定任务何时被执行。
@@ -93,7 +113,7 @@ func WithRetry(count int, delay time.Duration) TimerTaskOption {
 	}
 }
 
-// WithBuckets 设置任务桶数量（仅 Redis 模式有效），默认 128。
+// WithBuckets 设置任务桶数量（仅 Redis 后端 github.com/oekit/timertask/redis 有效），默认 128。
 func WithBuckets(n int) TimerTaskOption {
 	return func(c *config) {
 		if n < 2 {
@@ -118,8 +138,8 @@ func WithWorkers(n int) TimerTaskOption {
 
 // WithOnFailure 设置任务最终失败回调。
 // 当任务重试次数用完后调用，可用于告警、埋点等；注意这是进程内的同步回调，
-// 不是持久死信——RedisBackend 会自动把最终失败的任务写入 Redis 死信 ZSet，
-// LocalBackend 没有持久死信。
+// 不是持久死信——Redis 后端（github.com/oekit/timertask/redis）会自动把最终
+// 失败的任务写入 Redis 死信 ZSet，LocalBackend 没有持久死信。
 // 默认仅记录日志。
 func WithOnFailure(fn func(task *Task, err error)) TimerTaskOption {
 	return func(c *config) {
@@ -129,7 +149,8 @@ func WithOnFailure(fn func(task *Task, err error)) TimerTaskOption {
 
 // WithDeliveryMode 设置投递语义。默认 DeliveryAtMostOnce（与历史行为一致）。
 // DeliveryAtLeastOnce 时可用 WithVisibilityTimeout 调整租约时长。
-// 仅 RedisBackend 生效；LocalBackend 为纯内存，无持久投递语义。
+// 仅 Redis 后端（github.com/oekit/timertask/redis）生效；LocalBackend 为纯内存，
+// 无持久投递语义。
 func WithDeliveryMode(m DeliveryMode) TimerTaskOption {
 	return func(c *config) { c.delivery = m }
 }
@@ -168,4 +189,44 @@ func applyOptions(opts []TimerTaskOption) config {
 		opt(&cfg)
 	}
 	return cfg
+}
+
+// BackendConfig 是选项解析后的后端配置。
+//
+// 存在原因：TimerTaskOption 的底层类型 config 是未导出的，嵌套后端模块
+// （github.com/oekit/timertask/redis，独立 module）无法直接解析选项。
+// 通过本结构把解析结果交给嵌套模块，下游调用方只需改 import 路径，
+// 选项写法（timertask.WithWorkers(4) 等）保持不变。
+type BackendConfig struct {
+	// Workers worker 数量。
+	Workers int
+	// RetryCount 任务重试次数。
+	RetryCount int
+	// RetryDelay 任务重试间隔。
+	RetryDelay time.Duration
+	// Buckets 分片桶数（仅 Redis 后端有效，本地后端忽略）。
+	Buckets int
+	// OnFailure 任务最终失败回调（可为 nil）。
+	OnFailure func(*Task, error)
+	// Delivery 投递语义。
+	Delivery DeliveryMode
+	// VisibilityTimeout at-least-once 模式的租约时长。
+	VisibilityTimeout time.Duration
+}
+
+// ResolveOptions 解析选项并返回后端配置。
+//
+// 供嵌套后端模块使用；普通调用方用 NewLocalBackend 等构造函数即可，
+// 无需直接调用本函数。
+func ResolveOptions(opts ...TimerTaskOption) BackendConfig {
+	cfg := applyOptions(opts)
+	return BackendConfig{
+		Workers:           cfg.workers,
+		RetryCount:        cfg.retryCount,
+		RetryDelay:        cfg.retryDelay,
+		Buckets:           cfg.buckets,
+		OnFailure:         cfg.onFailure,
+		Delivery:          cfg.delivery,
+		VisibilityTimeout: cfg.visibilityTimeout,
+	}
 }

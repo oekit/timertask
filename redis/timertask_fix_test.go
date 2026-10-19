@@ -1,4 +1,4 @@
-package timertask
+package redis
 
 import (
 	"context"
@@ -6,6 +6,8 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	"github.com/oekit/timertask"
 )
 
 // TestShardManager_HeartbeatFailureGatesAssignment 回归测试（W1-T5）：
@@ -64,9 +66,9 @@ func TestRedisBackend_DeadLetterOnFinalFailure(t *testing.T) {
 	b, _ := newTestRedisBackend(t)
 	ctx := context.Background()
 
-	b.handler = func(context.Context, *Task) error { return errors.New("always fail") }
+	b.handler = func(context.Context, *timertask.Task) error { return errors.New("always fail") }
 
-	task := &Task{ID: "dead-1", EndTime: time.Now().Add(-time.Hour).Unix(), Action: "x"}
+	task := &timertask.Task{ID: "dead-1", EndTime: time.Now().Add(-time.Hour).Unix(), Action: "x"}
 	if err := b.Send(ctx, task); err != nil {
 		t.Fatal(err)
 	}
@@ -94,7 +96,7 @@ func TestRedisBackend_RequeueOnShutdown(t *testing.T) {
 
 	// 直接往本地队列塞一个未处理任务（已被 ZREM 的状态模拟）
 	endTime := time.Now().Add(time.Hour).Unix()
-	queued := &Task{ID: "requeue-1", EndTime: endTime, Action: "x"}
+	queued := &timertask.Task{ID: "requeue-1", EndTime: endTime, Action: "x"}
 	b.localQueue <- &claim{task: queued}
 	if b.LocalPendingCount() != 1 {
 		t.Fatal("expected 1 pending local task")

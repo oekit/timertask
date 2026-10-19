@@ -1,4 +1,4 @@
-package timertask
+package redis
 
 import (
 	"context"
@@ -6,13 +6,13 @@ import (
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
-	"github.com/redis/go-redis/v9"
+	goredis "github.com/redis/go-redis/v9"
 )
 
 func newTestShardManager(t *testing.T, buzType string) (*ShardManager, *miniredis.Miniredis) {
 	t.Helper()
 	mr := miniredis.RunT(t)
-	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	c := goredis.NewClient(&goredis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = c.Close() })
 	return NewShardManager(buzType, c, 16), mr
 }
@@ -80,7 +80,7 @@ func TestShardManager_StartAssign_AssignsShards(t *testing.T) {
 	// 分配以心跳成功为前提（W1-T5 门控）：先完成一次心跳注册本客户端，
 	// 再 run assignShards 确保 membership 非空时产生分片分配。
 	mr := miniredis.RunT(t)
-	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	c := goredis.NewClient(&goredis.Options{Addr: mr.Addr()})
 	defer func() { _ = c.Close() }()
 	s := NewShardManager("test-svc", c, 16)
 	ctx := context.Background()

@@ -2,6 +2,34 @@
 
 由 ekit v0.34.0（git.enjoye.top/enjoydream/ekit，冻结维护）拆分而来。所有 notable 变更记录如下。
 
+## [redis/v0.2.0] — 2026-10-19
+
+- feat(redis): Redis 后端（分片 + 可靠投递）自根包迁入嵌套模块 `github.com/oekit/timertask/redis`
+  ——根模块依赖面剥离 go-redis，Redis 形态独立成模块按需引入
+
+## [v0.2.0] — 2026-10-19
+
+### Breaking
+- **Redis 后端迁至嵌套模块**：`RedisBackend`/`NewRedisBackend`/`ShardManager`/`NewShardManager`
+  从根包移除，改用 `github.com/oekit/timertask/redis`（import 路径替换即可，API 不变）；
+  根包保留 `Task`/`Handler`/全部 `With*` 选项，既有调用点一行不动
+- **根包不再依赖 `github.com/oekit/logx`**：日志改用标准库 `log/slog`（消费方经
+  `slog.SetDefault` 汇流）；同时剥离 `github.com/oekit/concurrency`（`async.GoSafe` 改为包内等价实现）
+
+### feat(local)：cron 调度器子包
+- `local.New(cfg)` / `Schedule(spec, fn)` / `Unschedule(spec)` / `Start(ctx)` / `Stop(ctx)`——
+  按 cron 表达式触发任务，表达式解析复用 `github.com/oekit/pkg/timex/cron`（不另写一份 cron）
+- 调度语义明确：并发度 `Config.Concurrency`（缺省 1 = 严格串行，同 spec 恒串行）；
+  错过触发点 `CatchUpSkip`（缺省，只补最近一个）/ `CatchUpAll`（逐个补，`MaxCatchUp` 封顶）；
+  `Stop(ctx)` **不打断**正在跑的任务并等待其结束（受调用方 ctx 约束），取消 `Start` 的 ctx
+  则停止调度并取消任务 ctx；未开始的触发点丢弃
+- 重复 `Schedule` 返回 `ErrDuplicateSpec`（不静默覆盖）
+- 假时钟驱动：`local.FakeClock` + `Advance`，触发点序列可断言、不依赖 sleep
+
+### build
+- 根模块依赖面：go.mod require 仅 `github.com/oekit/pkg`——`import timertask` 与
+  `import timertask/local` 的模块依赖面均不含 redis（纯 stdlib 嵌入式场景可用）
+
 ## [v0.1.10] — 2026-10-19
 
 - build: 矩阵内依赖地板对齐（align_floors 不动点）：concurrency v0.5.4 → v0.17.0、logx v0.6.0 → v0.7.0

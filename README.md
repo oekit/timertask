@@ -1,6 +1,6 @@
 # timertask
 
-> 分片定时任务——秒级延时/跨实例 Redis 后端
+> 分片定时任务——秒级延时/跨实例 Redis 后端 + cron 周期调度
 
 > 🌐 项目主页：**https://oekit.github.io/** · 名称由来：**O**pen **E**asy **Kit**（开源 · 易用 · 工具集合）
 > 🤖 AI Agent：本仓规范与硬规则见 [AGENTS.md](AGENTS.md)；机器可读索引见 [llms.txt](https://oekit.github.io/llms.txt)（接口签名以源码为准）。
@@ -8,13 +8,23 @@
 ## 安装
 
 ```bash
-go get github.com/oekit/timertask@v0.1.10
+go get github.com/oekit/timertask@v0.2.0
+# 需要 Redis 形态（嵌套模块，按需引入）：
+go get github.com/oekit/timertask/redis@v0.2.0
 ```
 
 ## 这个仓库做什么
 
 `timertask` 是**分片定时任务**：按任务 ID 哈希分片、支持秒级精度的延时任务、
-心跳续约防重复执行。提供 Local（进程内）与 Redis（跨实例）两种后端。
+心跳续约防重复执行。三块能力：
+
+- **本地后端**（根包 `LocalBackend`）：进程内延迟任务队列，**零 Redis 依赖**
+- **cron 周期调度**（子包 `timertask/local`）：按 cron 表达式触发任务，表达式解析复用
+  [pkg/timex/cron](https://github.com/oekit/pkg)；假时钟驱动，触发点序列可确定性断言
+- **Redis 后端**（嵌套模块 `timertask/redis`）：跨实例分片 + 可靠投递（租约 + Ack + 可见性超时）
+
+> v0.2.0 起 **Redis 后端自根包迁至嵌套模块**——根模块依赖面只剩 `github.com/oekit/pkg`，
+> `import timertask` 与 `import timertask/local` 的模块依赖面均**不含 redis**（纯 stdlib 嵌入式场景可用）。
 
 ## 快速使用
 
@@ -33,9 +43,22 @@ _ = backend.Send(ctx, &timertask.Task{
 })
 ```
 
+cron 周期调度（`timertask/local`）：
+
+```go
+import "github.com/oekit/timertask/local"
+
+sched, _ := local.New(local.Config{Concurrency: 1}) // 缺省严格串行
+_ = sched.Schedule("0 3 * * *", func(ctx context.Context, at time.Time) error {
+    return runNightly(ctx, at) // 按龄回收 / 事实合并 / 周期摘要
+})
+_ = sched.Start(ctx)
+```
+
 ## 边界
 
-- 跨实例去重需要 Redis → `NewRedisBackend`；cron 表达式解析在 [pkg/timex/cron](https://github.com/oekit/pkg)
+- 跨实例去重需要 Redis → 嵌套模块 `github.com/oekit/timertask/redis`；
+  cron 表达式解析在 [pkg/timex/cron](https://github.com/oekit/pkg)（`local` 子包直接复用，不另写一份）
 
 
 ## 矩阵总览（24 活跃模块，自动生成）

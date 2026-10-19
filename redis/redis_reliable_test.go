@@ -1,4 +1,4 @@
-package timertask
+package redis
 
 import (
 	"context"
@@ -7,25 +7,26 @@ import (
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
-	"github.com/redis/go-redis/v9"
+	"github.com/oekit/timertask"
+	goredis "github.com/redis/go-redis/v9"
 )
 
-func newReliableBackend(t *testing.T, vis time.Duration, handler Handler) *RedisBackend {
+func newReliableBackend(t *testing.T, vis time.Duration, handler timertask.Handler) *RedisBackend {
 	t.Helper()
 	mr := miniredis.RunT(t)
-	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	client := goredis.NewClient(&goredis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = client.Close() })
-	return NewRedisBackend("rel", client, handler, WithAtLeastOnce(vis))
+	return NewRedisBackend("rel", client, handler, timertask.WithAtLeastOnce(vis))
 }
 
 // TestAtLeastOnce_AckOnSuccess 验证成功后租约被释放（processing 清空）。
 func TestAtLeastOnce_AckOnSuccess(t *testing.T) {
 	done := make(chan struct{})
-	b := newReliableBackend(t, 30*time.Second, func(ctx context.Context, task *Task) error {
+	b := newReliableBackend(t, 30*time.Second, func(ctx context.Context, task *timertask.Task) error {
 		close(done)
 		return nil
 	})
-	task := &Task{ID: "ack-1", EndTime: time.Now().Unix() - 1, MaxRetry: 0}
+	task := &timertask.Task{ID: "ack-1", EndTime: time.Now().Unix() - 1, MaxRetry: 0}
 	if err := b.Send(context.Background(), task); err != nil {
 		t.Fatal(err)
 	}
@@ -55,11 +56,11 @@ func TestAtLeastOnce_AckOnSuccess(t *testing.T) {
 // TestAtLeastOnce_LeaseExpireRequeue 验证租约超时后任务被重投（kill -9 等价路径）。
 func TestAtLeastOnce_LeaseExpireRequeue(t *testing.T) {
 	var calls atomic.Int32
-	b := newReliableBackend(t, 1*time.Second, func(ctx context.Context, task *Task) error {
+	b := newReliableBackend(t, 1*time.Second, func(ctx context.Context, task *timertask.Task) error {
 		calls.Add(1)
 		return nil
 	})
-	task := &Task{ID: "lease-1", EndTime: time.Now().Unix() - 1, MaxRetry: 5}
+	task := &timertask.Task{ID: "lease-1", EndTime: time.Now().Unix() - 1, MaxRetry: 5}
 	if err := b.Send(context.Background(), task); err != nil {
 		t.Fatal(err)
 	}
@@ -72,7 +73,7 @@ func TestAtLeastOnce_LeaseExpireRequeue(t *testing.T) {
 
 	// 手动把租约拨成已过期，触发回扫重投
 	past := time.Now().Unix() - 10
-	if err = b.client.ZAdd(context.Background(), b.processingKey(), redis.Z{
+	if err = b.client.ZAdd(context.Background(), b.processingKey(), goredis.Z{
 		Score:  float64(past),
 		Member: mustJSON(task),
 	}).Err(); err != nil {
@@ -98,16 +99,16 @@ func TestAtLeastOnce_LeaseExpireRequeue(t *testing.T) {
 // TestAtMostOnce_DefaultUnchanged 默认路径仍为 claim 即删。
 func TestAtMostOnce_DefaultUnchanged(t *testing.T) {
 	mr := miniredis.RunT(t)
-	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	client := goredis.NewClient(&goredis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = client.Close() })
-	b := NewRedisBackend("amo", client, func(ctx context.Context, task *Task) error {
+	b := NewRedisBackend("amo", client, func(ctx context.Context, task *timertask.Task) error {
 		return nil
-	}, WithBuckets(4))
+	}, timertask.WithBuckets(4))
 	// 不启 Start，手动把全部分片划给本实例
 	for i := 0; i < 4; i++ {
 		b.shardManager.myShards = append(b.shardManager.myShards, i)
 	}
-	task := &Task{ID: "amo-1", EndTime: time.Now().Unix() - 1, MaxRetry: 0}
+	task := &timertask.Task{ID: "amo-1", EndTime: time.Now().Unix() - 1, MaxRetry: 0}
 	if err := b.Send(context.Background(), task); err != nil {
 		t.Fatal(err)
 	}

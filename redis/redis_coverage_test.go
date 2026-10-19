@@ -1,4 +1,4 @@
-package timertask
+package redis
 
 import (
 	"context"
@@ -6,15 +6,16 @@ import (
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
-	"github.com/redis/go-redis/v9"
+	"github.com/oekit/timertask"
+	goredis "github.com/redis/go-redis/v9"
 )
 
 func TestNewRedisBackend_SetsDefaults(t *testing.T) {
 	mr := miniredis.RunT(t)
-	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	c := goredis.NewClient(&goredis.Options{Addr: mr.Addr()})
 	defer func() { _ = c.Close() }()
 
-	b := NewRedisBackend("test", c, func(ctx context.Context, t *Task) error { return nil })
+	b := NewRedisBackend("test", c, func(ctx context.Context, t *timertask.Task) error { return nil })
 	if b == nil {
 		t.Fatal("NewRedisBackend returned nil")
 	}
@@ -34,13 +35,13 @@ func TestNewRedisBackend_SetsDefaults(t *testing.T) {
 
 func TestNewRedisBackend_AppliesOptions(t *testing.T) {
 	mr := miniredis.RunT(t)
-	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	c := goredis.NewClient(&goredis.Options{Addr: mr.Addr()})
 	defer func() { _ = c.Close() }()
 
-	b := NewRedisBackend("test", c, func(ctx context.Context, t *Task) error { return nil },
-		WithBuckets(8),
-		WithWorkers(4),
-		WithRetry(3, 50*time.Millisecond),
+	b := NewRedisBackend("test", c, func(ctx context.Context, t *timertask.Task) error { return nil },
+		timertask.WithBuckets(8),
+		timertask.WithWorkers(4),
+		timertask.WithRetry(3, 50*time.Millisecond),
 	)
 	if b.buckets != 8 {
 		t.Errorf("buckets = %d, want 8", b.buckets)
@@ -58,11 +59,11 @@ func TestNewRedisBackend_AppliesOptions(t *testing.T) {
 
 func TestRedisBackend_Start_RunsThenStops(t *testing.T) {
 	mr := miniredis.RunT(t)
-	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	c := goredis.NewClient(&goredis.Options{Addr: mr.Addr()})
 	defer func() { _ = c.Close() }()
 
-	b := NewRedisBackend("test", c, func(ctx context.Context, t *Task) error { return nil },
-		WithWorkers(1),
+	b := NewRedisBackend("test", c, func(ctx context.Context, t *timertask.Task) error { return nil },
+		timertask.WithWorkers(1),
 	)
 	ctx, cancel := context.WithCancel(context.Background())
 
