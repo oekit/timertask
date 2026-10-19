@@ -1,4 +1,4 @@
-package timertask
+package redis
 
 import (
 	"context"
@@ -6,21 +6,22 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/redis/go-redis/v9"
+	"github.com/oekit/timertask"
+	goredis "github.com/redis/go-redis/v9"
 )
 
 // processingKeyPattern 是 at-least-once 模式下的租约集（全局按 buzType）。
 // score = 租约到期时间（Unix 秒）。
 const processingKeyPattern = "{timertask.%s}.processing"
 
-// defaultVisibilityTimeout 默认租约时长：handler 超过该时长未 Ack 则视为失败并重投。
-const defaultVisibilityTimeout = 60 * time.Second
+// 租约时长的默认值由父模块 timertask.WithAtLeastOnce / WithVisibilityTimeout
+// 统一提供（经 timertask.ResolveOptions 下发），本模块不重复定义。
 
 // claimLeaseScript 原子 claim：score 到期则从分片 ZSet 移入 processing 租约集。
 //
 // KEYS[1]=shard zset, KEYS[2]=processing
 // ARGV[1]=member, ARGV[2]=now, ARGV[3]=lease deadline (unix sec)
-var claimLeaseScript = redis.NewScript(`
+var claimLeaseScript = goredis.NewScript(`
 	local score = redis.call('zscore', KEYS[1], ARGV[1])
 	if score and tonumber(score) <= tonumber(ARGV[2]) then
 		redis.call('zrem', KEYS[1], ARGV[1])
@@ -62,14 +63,14 @@ func (b *RedisBackend) claimTaskWithLease(ctx context.Context, shardKey, member 
 func (b *RedisBackend) reapExpiredLeases(ctx context.Context) {
 	now := time.Now().Unix()
 	pkey := b.processingKey()
-	members, err := b.client.ZRangeByScore(ctx, pkey, &redis.ZRangeBy{
+	members, err := b.client.ZRangeByScore(ctx, pkey, &goredis.ZRangeBy{
 		Min:    "0",
 		Max:    fmt.Sprintf("%d", now),
 		Offset: 0,
 		Count:  defaultBatch,
 	}).Result()
 	if err != nil {
-		if err != redis.Nil {
+		if err != goredis.Nil {
 			log.Error("reap ZRangeByScore error", "err", err)
 		}
 		return
@@ -102,7 +103,7 @@ func (b *RedisBackend) reapExpiredLeases(ctx context.Context) {
 		// 回投失败会记日志，仍优于静默。
 		pipe := b.client.Pipeline()
 		pipe.ZRem(ctx, pkey, member)
-		pipe.ZAdd(ctx, key, redis.Z{Score: float64(task.EndTime), Member: string(data)})
+		pipe.ZAdd(ctx, key, goredis.Z{Score: float64(task.EndTime), Member: string(data)})
 		if _, err := pipe.Exec(ctx); err != nil {
 			log.Error("reap requeue failed", "taskID", task.ID, "err", err)
 			continue
@@ -143,7 +144,7 @@ func (b *RedisBackend) reapLoop(ctx context.Context) {
 }
 
 // mustJSON 序列化 task（测试辅助）。
-func mustJSON(t *Task) string {
+func mustJSON(t *timertask.Task) string {
 	data, err := json.Marshal(t)
 	if err != nil {
 		panic(err)

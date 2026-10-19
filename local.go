@@ -5,8 +5,6 @@ import (
 	"context"
 	"sync"
 	"time"
-
-	"github.com/oekit/concurrency/async"
 )
 
 // localTaskItem 本地任务条目（用于优先队列）。
@@ -116,7 +114,7 @@ func (b *LocalBackend) Send(ctx context.Context, task *Task) error {
 	heap.Push(&b.queue, item)
 	b.taskMap[task.ID] = item
 
-	log.Info("task scheduled", "taskID", task.ID, "endTime", task.EndTime)
+	logger.Info("task scheduled", "taskID", task.ID, "endTime", task.EndTime)
 	return nil
 }
 
@@ -124,11 +122,11 @@ func (b *LocalBackend) Send(ctx context.Context, task *Task) error {
 // ctx 取消时所有 goroutine 退出。
 func (b *LocalBackend) Start(ctx context.Context) error {
 	// 启动扫描器
-	async.GoSafe(func() { b.scanLoop(ctx) })
+	goSafe(func() { b.scanLoop(ctx) })
 
 	// 启动本地 Worker 池
 	for i := 0; i < b.workers; i++ {
-		async.GoSafe(func() { b.workerLoop(ctx) })
+		goSafe(func() { b.workerLoop(ctx) })
 	}
 
 	<-ctx.Done()
@@ -226,7 +224,7 @@ func (b *LocalBackend) processTask(ctx context.Context, task *Task) {
 			case <-retryTimer.C:
 			}
 			task.RetryCount = i
-			log.Warn("retrying task", "taskID", task.ID, "attempt", i, "maxRetry", task.MaxRetry)
+			logger.Warn("retrying task", "taskID", task.ID, "attempt", i, "maxRetry", task.MaxRetry)
 		}
 
 		// handler panic 就地收编为任务失败，走重试/onFailure 路径（见 runHandlerSafe）
@@ -234,11 +232,11 @@ func (b *LocalBackend) processTask(ctx context.Context, task *Task) {
 		if err == nil {
 			return
 		}
-		log.Error("handler error", "taskID", task.ID, "err", err)
+		logger.Error("handler error", "taskID", task.ID, "err", err)
 	}
 
 	// 重试次数用完，记录失败
-	log.Error("task failed after retries", "taskID", task.ID, "maxRetry", task.MaxRetry, "err", err)
+	logger.Error("task failed after retries", "taskID", task.ID, "maxRetry", task.MaxRetry, "err", err)
 	if b.onFailure != nil {
 		b.onFailure(task, err)
 	}

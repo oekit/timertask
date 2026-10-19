@@ -1,4 +1,4 @@
-package timertask
+package redis
 
 import (
 	"context"
@@ -6,31 +6,32 @@ import (
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
-	"github.com/redis/go-redis/v9"
+	"github.com/oekit/timertask"
+	goredis "github.com/redis/go-redis/v9"
 )
 
 func newTestRedisBackend(t *testing.T) (*RedisBackend, *miniredis.Miniredis) {
 	t.Helper()
 	mr := miniredis.RunT(t)
-	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	c := goredis.NewClient(&goredis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = c.Close() })
 
-	cfg := applyOptions([]TimerTaskOption{
-		WithBuckets(4),
-		WithWorkers(1),
-		WithRetry(0, 10*time.Millisecond),
-	})
+	cfg := timertask.ResolveOptions([]timertask.TimerTaskOption{
+		timertask.WithBuckets(4),
+		timertask.WithWorkers(1),
+		timertask.WithRetry(0, 10*time.Millisecond),
+	}...)
 	return &RedisBackend{
 		client:       c,
 		buzType:      "test",
-		handler:      func(ctx context.Context, task *Task) error { return nil },
-		buckets:      cfg.buckets,
-		workers:      cfg.workers,
-		retryCount:   cfg.retryCount,
-		retryDelay:   cfg.retryDelay,
+		handler:      func(ctx context.Context, task *timertask.Task) error { return nil },
+		buckets:      cfg.Buckets,
+		workers:      cfg.Workers,
+		retryCount:   cfg.RetryCount,
+		retryDelay:   cfg.RetryDelay,
 		localQueue:   make(chan *claim, 1000),
 		stopChan:     make(chan struct{}),
-		shardManager: NewShardManager("test", c, cfg.buckets),
+		shardManager: NewShardManager("test", c, cfg.Buckets),
 	}, mr
 }
 
@@ -38,7 +39,7 @@ func TestRedisBackend_Send(t *testing.T) {
 	b, mr := newTestRedisBackend(t)
 	ctx := context.Background()
 
-	task := &Task{
+	task := &timertask.Task{
 		ID:      "send-1",
 		EndTime: time.Now().Add(time.Hour).Unix(),
 		Action:  "test",
@@ -67,7 +68,7 @@ func TestRedisBackend_Send_Distribution(t *testing.T) {
 	ctx := context.Background()
 
 	for i := 0; i < 100; i++ {
-		task := &Task{
+		task := &timertask.Task{
 			ID:      "dist-" + string(rune('0'+i%10)) + "-" + string(rune('0'+(i/10)%10)),
 			EndTime: time.Now().Add(time.Hour).Unix(),
 		}
@@ -91,12 +92,12 @@ func TestRedisBackend_Send_Distribution(t *testing.T) {
 
 func TestRedisBackend_Send_SetsDefaults(t *testing.T) {
 	mr := miniredis.RunT(t)
-	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	c := goredis.NewClient(&goredis.Options{Addr: mr.Addr()})
 	defer c.Close()
 	b := &RedisBackend{
 		client:       c,
 		buzType:      "test",
-		handler:      func(ctx context.Context, task *Task) error { return nil },
+		handler:      func(ctx context.Context, task *timertask.Task) error { return nil },
 		buckets:      4,
 		workers:      1,
 		retryCount:   3,
@@ -106,7 +107,7 @@ func TestRedisBackend_Send_SetsDefaults(t *testing.T) {
 		shardManager: NewShardManager("test", c, 4),
 	}
 
-	task := &Task{
+	task := &timertask.Task{
 		ID:      "defaults-1",
 		EndTime: time.Now().Add(time.Hour).Unix(),
 	}
@@ -134,7 +135,7 @@ func TestRedisBackend_PendingCount(t *testing.T) {
 	}
 
 	for i := 0; i < 3; i++ {
-		task := &Task{
+		task := &timertask.Task{
 			ID:      "pending-" + string(rune('0'+i)),
 			EndTime: time.Now().Add(time.Hour).Unix(),
 		}
@@ -158,7 +159,7 @@ func TestRedisBackend_LocalPendingCount(t *testing.T) {
 		t.Errorf("expected 0 initially, got %d", got)
 	}
 
-	task := &Task{ID: "local-1"}
+	task := &timertask.Task{ID: "local-1"}
 	b.localQueue <- &claim{task: task, member: mustJSON(task)}
 	if got := b.LocalPendingCount(); got != 1 {
 		t.Errorf("expected 1, got %d", got)
@@ -167,7 +168,7 @@ func TestRedisBackend_LocalPendingCount(t *testing.T) {
 
 func TestRedisBackend_ParseTask_RoundTrip(t *testing.T) {
 	b, _ := newTestRedisBackend(t)
-	task := &Task{
+	task := &timertask.Task{
 		ID:         "parse-1",
 		CreateTime: 1000,
 		EndTime:    2000,
@@ -204,29 +205,29 @@ func TestRedisBackend_ConsumeRemoteOnce_PushToLocalQueue(t *testing.T) {
 	// 直接测 consumeRemoteOnce: 把 task 放入 ZSet (score=now-1 过期),
 	// 验证 deleteScript Lua 修复后能正确把 task claim + push 到 localQueue。
 	mr := miniredis.RunT(t)
-	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	c := goredis.NewClient(&goredis.Options{Addr: mr.Addr()})
 	defer c.Close()
-	cfg := applyOptions([]TimerTaskOption{WithBuckets(4), WithWorkers(1)})
+	cfg := timertask.ResolveOptions([]timertask.TimerTaskOption{timertask.WithBuckets(4), timertask.WithWorkers(1)}...)
 	b := &RedisBackend{
 		client:       c,
 		buzType:      "test",
-		handler:      func(ctx context.Context, task *Task) error { return nil },
-		buckets:      cfg.buckets,
-		workers:      cfg.workers,
-		retryCount:   cfg.retryCount,
-		retryDelay:   cfg.retryDelay,
+		handler:      func(ctx context.Context, task *timertask.Task) error { return nil },
+		buckets:      cfg.Buckets,
+		workers:      cfg.Workers,
+		retryCount:   cfg.RetryCount,
+		retryDelay:   cfg.RetryDelay,
 		localQueue:   make(chan *claim, 100),
 		stopChan:     make(chan struct{}),
-		shardManager: NewShardManager("test", c, cfg.buckets),
+		shardManager: NewShardManager("test", c, cfg.Buckets),
 	}
 
 	// 强制让当前 node 拥有所有 shard
-	for i := 0; i < cfg.buckets; i++ {
+	for i := 0; i < cfg.Buckets; i++ {
 		b.shardManager.myShards = append(b.shardManager.myShards, i)
 	}
 
 	// 插入一个已过期的 task 到 shard 0 (score=now-60, 必过期)
-	expiredTask := &Task{
+	expiredTask := &timertask.Task{
 		ID:      "expired-1",
 		EndTime: time.Now().Unix() - 60,
 		Action:  "test",
@@ -270,7 +271,7 @@ func TestDeleteScript_ReproAndFix(t *testing.T) {
 	// (miniredis 下会假阳性). EndTime 没到的 task 由 ZRangeByScore
 	// 的 Min/Max 在更外层过滤掉, 不会进 deleteScript.
 	mr := miniredis.RunT(t)
-	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	c := goredis.NewClient(&goredis.Options{Addr: mr.Addr()})
 	defer c.Close()
 	ctx := context.Background()
 
@@ -290,7 +291,7 @@ func TestDeleteScript_ReproAndFix(t *testing.T) {
 			member := `{"task_id":"` + tc.name + `","end_time":1000}`
 			// 每次清空 zset, 避免上一个 case 干扰
 			c.Del(ctx, key)
-			if err := c.ZAdd(ctx, key, redis.Z{
+			if err := c.ZAdd(ctx, key, goredis.Z{
 				Score:  1000,
 				Member: member,
 			}).Err(); err != nil {
@@ -324,13 +325,13 @@ func TestRedisBackend_GetAllInstances_NotApplicable(t *testing.T) {
 func TestDeleteScript_TonumberComparison(t *testing.T) {
 	mr := miniredis.RunT(t)
 	defer mr.Close()
-	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	c := goredis.NewClient(&goredis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = c.Close() })
 	ctx := context.Background()
 	const key = "test:zset"
 
 	// 9 位 score 数值上 <= 9 位 now;旧字典序写法在混位数场景恒假
-	if err := c.ZAdd(ctx, key, redis.Z{Score: 999999998, Member: "t-short"}).Err(); err != nil {
+	if err := c.ZAdd(ctx, key, goredis.Z{Score: 999999998, Member: "t-short"}).Err(); err != nil {
 		t.Fatal(err)
 	}
 	res, err := deleteScript.Run(ctx, c, []string{key}, "t-short", "999999999").Result()
@@ -345,7 +346,7 @@ func TestDeleteScript_TonumberComparison(t *testing.T) {
 	}
 
 	// 未到期任务不删
-	if zerr := c.ZAdd(ctx, key, redis.Z{Score: 9999999999, Member: "t-future"}).Err(); zerr != nil {
+	if zerr := c.ZAdd(ctx, key, goredis.Z{Score: 9999999999, Member: "t-future"}).Err(); zerr != nil {
 		t.Fatal(zerr)
 	}
 	res2, err := deleteScript.Run(ctx, c, []string{key}, "t-future", "999999999").Result()

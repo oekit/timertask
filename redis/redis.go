@@ -1,4 +1,4 @@
-package timertask
+package redis
 
 import (
 	"context"
@@ -12,18 +12,16 @@ import (
 
 	"github.com/oekit/concurrency/async"
 	"github.com/oekit/logx"
-	"github.com/redis/go-redis/v9"
+	"github.com/oekit/timertask"
+	goredis "github.com/redis/go-redis/v9"
 )
 
 const (
-	taskKeyPattern    = "{timertask.%s}.shard.%d"
-	heartbeatKey      = "{timertask.%s}.heartbeat"
-	deadLetterKey     = "{timertask.%s}.dead"
-	defaultBuckets    = 128
-	defaultBatch      = 300
-	defaultWorkers    = 10
-	defaultRetryCount = 3
-	defaultRetryDelay = 5 * time.Second
+	taskKeyPattern = "{timertask.%s}.shard.%d"
+	heartbeatKey   = "{timertask.%s}.heartbeat"
+	deadLetterKey  = "{timertask.%s}.dead"
+	// defaultBatch 单次扫描拉取的任务条数上限。
+	defaultBatch = 300
 	// deadLetterMaxLen 死信 ZSet 保留上限（按失败时间只保留最近 N 条），防止无限增长。
 	deadLetterMaxLen = 10000
 )
@@ -44,7 +42,7 @@ const (
 // 等长（10 位 epoch）时恰好等价数值比较，但 score 位长不同（如 9 位的
 // EndTime=999999999，数值上已到期）时条件恒假:任务永远无法 claim 且
 // ZRangeByScore 按 score 升序会让卡死任务占满批次饿死整个 shard。
-var deleteScript = redis.NewScript(`
+var deleteScript = goredis.NewScript(`
 	local score = redis.call('zscore', KEYS[1], ARGV[1])
 	if score and tonumber(score) <= tonumber(ARGV[2]) then
 		return redis.call('zrem', KEYS[1], ARGV[1])
@@ -53,14 +51,14 @@ var deleteScript = redis.NewScript(`
 	end
 `)
 
-var log = logx.Delegating("timertask")
+var log = logx.Delegating("timertask/redis")
 
 // RedisBackend 是基于 Redis ZSet 的分布式延迟任务实现。
 type RedisBackend struct {
-	client     redis.UniversalClient
+	client     goredis.UniversalClient
 	buzType    string
-	handler    Handler
-	onFailure  func(*Task, error)
+	handler    timertask.Handler
+	onFailure  func(*timertask.Task, error)
 	buckets    int
 	workers    int
 	retryCount int
@@ -69,8 +67,8 @@ type RedisBackend struct {
 	// 分片管理
 	shardManager *ShardManager
 
-	// 投递语义：DeliveryAtMostOnce（默认）或 DeliveryAtLeastOnce（租约+Ack）
-	delivery          DeliveryMode
+	// 投递语义：timertask.DeliveryAtMostOnce（默认）或 timertask.DeliveryAtLeastOnce（租约+Ack）
+	delivery          timertask.DeliveryMode
 	visibilityTimeout time.Duration
 
 	// 本地队列：携带原始 ZSet member，可靠模式 Ack 时使用
@@ -81,7 +79,7 @@ type RedisBackend struct {
 
 // claim 是本地队列中的已 claim 任务，member 为 ZSet 原始成员串。
 type claim struct {
-	task   *Task
+	task   *timertask.Task
 	member string
 }
 
@@ -90,19 +88,19 @@ type claim struct {
 //   - buzType: 业务类型标识（区分不同业务的任务）
 //   - client: Redis 客户端（支持单机和集群）
 //   - handler: 任务处理函数
-func NewRedisBackend(buzType string, client redis.UniversalClient, handler Handler, opts ...TimerTaskOption) *RedisBackend {
-	cfg := applyOptions(opts)
+func NewRedisBackend(buzType string, client goredis.UniversalClient, handler timertask.Handler, opts ...timertask.TimerTaskOption) *RedisBackend {
+	cfg := timertask.ResolveOptions(opts...)
 	b := &RedisBackend{
 		client:            client,
 		buzType:           buzType,
 		handler:           handler,
-		onFailure:         cfg.onFailure,
-		buckets:           cfg.buckets,
-		workers:           cfg.workers,
-		retryCount:        cfg.retryCount,
-		retryDelay:        cfg.retryDelay,
-		delivery:          cfg.delivery,
-		visibilityTimeout: cfg.visibilityTimeout,
+		onFailure:         cfg.OnFailure,
+		buckets:           cfg.Buckets,
+		workers:           cfg.Workers,
+		retryCount:        cfg.RetryCount,
+		retryDelay:        cfg.RetryDelay,
+		delivery:          cfg.Delivery,
+		visibilityTimeout: cfg.VisibilityTimeout,
 		localQueue:        make(chan *claim, 100000),
 		stopChan:          make(chan struct{}),
 	}
@@ -115,7 +113,7 @@ func NewRedisBackend(buzType string, client redis.UniversalClient, handler Handl
 
 // Send 提交一个延迟任务。
 // task.EndTime（Unix 秒）决定任务何时被执行。
-func (b *RedisBackend) Send(ctx context.Context, task *Task) error {
+func (b *RedisBackend) Send(ctx context.Context, task *timertask.Task) error {
 	if task.CreateTime == 0 {
 		task.CreateTime = time.Now().Unix()
 	}
@@ -128,7 +126,7 @@ func (b *RedisBackend) Send(ctx context.Context, task *Task) error {
 	}
 
 	key := b.taskKey(task.ID)
-	_, err = b.client.ZAdd(ctx, key, redis.Z{
+	_, err = b.client.ZAdd(ctx, key, goredis.Z{
 		Score:  float64(task.EndTime),
 		Member: string(data),
 	}).Result()
@@ -152,7 +150,7 @@ func (b *RedisBackend) Start(ctx context.Context) error {
 	async.GoSafe(func() { b.consumeRemoteLoop(ctx) })
 
 	// at-least-once：启动租约回扫——崩溃实例未 Ack 的租约到期后由本循环捡回重投
-	if b.delivery == DeliveryAtLeastOnce {
+	if b.delivery == timertask.DeliveryAtLeastOnce {
 		async.GoSafe(func() { b.reapLoop(ctx) })
 	}
 
@@ -169,7 +167,7 @@ func (b *RedisBackend) Start(ctx context.Context) error {
 	b.stopOnce.Do(func() { close(b.stopChan) })
 	b.requeuePendingOnShutdown()
 	// at-least-once：停机同步补一轮租约回扫（reapLoop 内也会做，这里兜底时序竞态）
-	if b.delivery == DeliveryAtLeastOnce {
+	if b.delivery == timertask.DeliveryAtLeastOnce {
 		b.requeueLeasesOnShutdown()
 	}
 	return ctx.Err()
@@ -205,11 +203,11 @@ func (b *RedisBackend) requeuePendingOnShutdown() {
 			}
 			key := b.taskKey(task.ID)
 			pipe := b.client.Pipeline()
-			pipe.ZAdd(ctx, key, redis.Z{
+			pipe.ZAdd(ctx, key, goredis.Z{
 				Score:  float64(task.EndTime),
 				Member: string(data),
 			})
-			if b.delivery == DeliveryAtLeastOnce {
+			if b.delivery == timertask.DeliveryAtLeastOnce {
 				pipe.ZRem(ctx, b.processingKey(), c.member)
 			}
 			if _, err := pipe.Exec(ctx); err != nil {
@@ -252,14 +250,14 @@ func (b *RedisBackend) consumeRemoteOnce(ctx context.Context) {
 		key := b.shardKey(shard)
 
 		// 使用 Lua 脚本原子获取并删除到期任务
-		tasks, err := b.client.ZRangeByScore(ctx, key, &redis.ZRangeBy{
+		tasks, err := b.client.ZRangeByScore(ctx, key, &goredis.ZRangeBy{
 			Min:    "0",
 			Max:    strconv.FormatInt(now, 10),
 			Offset: 0,
 			Count:  defaultBatch,
 		}).Result()
 		if err != nil {
-			if !errors.Is(err, redis.Nil) {
+			if !errors.Is(err, goredis.Nil) {
 				log.Error("ZRangeByScore error", "err", err)
 			}
 			continue
@@ -268,7 +266,7 @@ func (b *RedisBackend) consumeRemoteOnce(ctx context.Context) {
 		for _, data := range tasks {
 			var ok bool
 			var err error
-			if b.delivery == DeliveryAtLeastOnce {
+			if b.delivery == timertask.DeliveryAtLeastOnce {
 				ok, err = b.claimTaskWithLease(ctx, key, data, now)
 			} else {
 				var result int
@@ -321,7 +319,7 @@ func (b *RedisBackend) processTask(ctx context.Context, c *claim) {
 	var err error
 	normalizeRetry(task)
 	defer func() {
-		if b.delivery == DeliveryAtLeastOnce {
+		if b.delivery == timertask.DeliveryAtLeastOnce {
 			// 成功或已进死信的终态：释放租约；仅 handler 仍在重试窗口内不 Ack。
 			// 本函数返回即终态（成功 return / 死信+onFailure）。
 			b.ackTask(context.Background(), c.member)
@@ -375,7 +373,7 @@ func (b *RedisBackend) processTask(ctx context.Context, c *claim) {
 // sendToDeadLetter 将重试耗尽的任务写入持久死信 ZSet（score 为失败时间戳），
 // 供人工排查或补偿任务消费。写入为 best-effort：失败仅记录日志，不阻断 onFailure。
 // 失败原因已在调用方日志中携带，死信只存任务本体。
-func (b *RedisBackend) sendToDeadLetter(task *Task) {
+func (b *RedisBackend) sendToDeadLetter(task *timertask.Task) {
 	data, err := json.Marshal(task)
 	if err != nil {
 		log.Error("dead letter marshal failed", "taskID", task.ID, "err", err)
@@ -383,7 +381,7 @@ func (b *RedisBackend) sendToDeadLetter(task *Task) {
 	}
 	key := fmt.Sprintf(deadLetterKey, b.buzType)
 	pipe := b.client.Pipeline()
-	pipe.ZAdd(context.Background(), key, redis.Z{
+	pipe.ZAdd(context.Background(), key, goredis.Z{
 		Score:  float64(time.Now().Unix()),
 		Member: string(data),
 	})
@@ -395,8 +393,8 @@ func (b *RedisBackend) sendToDeadLetter(task *Task) {
 }
 
 // parseTask 解析任务数据。
-func (b *RedisBackend) parseTask(data string) *Task {
-	var task Task
+func (b *RedisBackend) parseTask(data string) *timertask.Task {
+	var task timertask.Task
 	if err := json.Unmarshal([]byte(data), &task); err != nil {
 		log.Error("unmarshal error", "err", err)
 		return nil

@@ -1,4 +1,4 @@
-package timertask
+package redis
 
 import (
 	"context"
@@ -13,7 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/redis/go-redis/v9"
+	goredis "github.com/redis/go-redis/v9"
 )
 
 // ShardManager 分片管理器。
@@ -21,7 +21,7 @@ import (
 type ShardManager struct {
 	clientID    string
 	buzType     string
-	client      redis.UniversalClient
+	client      goredis.UniversalClient
 	totalShards int
 	myShards    []int
 	mu          sync.RWMutex
@@ -37,7 +37,7 @@ type ShardManager struct {
 }
 
 // NewShardManager 创建分片管理器。
-func NewShardManager(buzType string, client redis.UniversalClient, totalShards int) *ShardManager {
+func NewShardManager(buzType string, client goredis.UniversalClient, totalShards int) *ShardManager {
 	clientID := generateClientID()
 	return &ShardManager{
 		clientID:          clientID,
@@ -82,7 +82,7 @@ func (s *ShardManager) heartbeat(ctx context.Context) {
 	now := time.Now().UnixMilli()
 
 	// 使用 ZADD 注册心跳（score 为时间戳）
-	_, err := s.client.ZAdd(ctx, key, redis.Z{
+	_, err := s.client.ZAdd(ctx, key, goredis.Z{
 		Score:  float64(now),
 		Member: s.clientID,
 	}).Result()
