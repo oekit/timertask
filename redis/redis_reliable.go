@@ -82,8 +82,15 @@ func (b *RedisBackend) reapExpiredLeases(ctx context.Context) {
 			b.ackTask(ctx, member)
 			continue
 		}
+		// 负数 MaxRetry 表示「不重试」，与 worker 侧 processTask 的归一口径
+		// 一致（否则同一份任务在两条路径上的重试语义会分叉）。
+		normalizeRetry(task)
 		task.RetryCount++
-		if task.RetryCount > task.MaxRetry && task.MaxRetry > 0 {
+		// 判定「重试次数耗尽」**不能**再加 `task.MaxRetry > 0` 的守卫：
+		// MaxRetry<=0 时该守卫会让本分支永远不可达 ⇒ 租约到期后任务被无限
+		// 重投（既不进死信、也不停止）——而 worker 侧对同一份任务早就判过
+		// 「执行一次、不重试」了。
+		if task.RetryCount > task.MaxRetry {
 			// 租约重投次数耗尽 → 死信 + Ack
 			log.Error("lease requeue exhausted", "taskID", task.ID, "retryCount", task.RetryCount)
 			b.sendToDeadLetter(task)

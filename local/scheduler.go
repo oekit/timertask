@@ -178,7 +178,7 @@ func (s *Scheduler) Schedule(spec string, fn Task) error {
 	s.mu.Unlock()
 
 	if started {
-		go s.runEntry(e)
+		goSafe(func() { s.runEntry(e) })
 	}
 	s.notify()
 	return nil
@@ -228,9 +228,9 @@ func (s *Scheduler) Start(ctx context.Context) error {
 	s.mu.Unlock()
 
 	for _, e := range entries {
-		go s.runEntry(e)
+		goSafe(func() { s.runEntry(e) })
 	}
-	go s.run(ctx)
+	goSafe(func() { s.run(ctx) })
 
 	select {
 	case <-ctx.Done():
