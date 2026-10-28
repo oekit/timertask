@@ -2,6 +2,12 @@
 
 由 ekit v0.34.0（git.enjoye.top/enjoydream/ekit，冻结维护）拆分而来。所有 notable 变更记录如下。
 
+## [v0.2.2] — 2026-10-28
+
+- fix(redis): 重试窗口内被中断仍 Ack 租约 ⇒ 任务**永久丢失**——defer 里的 Ack 在每条返回路径上都执行（含 ctx 取消 / 停机那条，与同处注释「仅 handler 仍在重试窗口内不 Ack」直接矛盾），任务已从分片 ZSet claim 走、租约是它唯一的去处，释放了就落到「哪都不是」的地方 ⇒ at-least-once 承诺失效
+- fix(timertask): 租约回扫的「重试耗尽」分支**不可达** ⇒ `MaxRetry<=0` 的任务被无限重投（既不进死信、也不停止）——判定带了 `&& task.MaxRetry > 0` 守卫，且回扫侧未做 worker 侧那套负数归一 ⇒ 同一份任务两条路径语义分叉；另把 `MaxRetry` 的三态语义（0=用后端默认 / >0=显式次数 / <0=不重试）写进 godoc
+- fix(local): 调度器用**裸 `go`** 启动内部 goroutine，违反「禁止裸 go func」硬规则——用户任务的 panic 已由 `invoke` 就地收编，但调度器自身（cron 计算、触发点记账）的 panic 仍会打死整个进程；`local` 包自带最小 `goSafe`（与根包同款形态；本包刻意不 import 根包，依赖面保持不变）
+
 ## [redis/v0.2.1] — 2026-10-20
 
 - build: 父模块依赖地板 v0.2.0 → v0.2.1（跟随 timertask v0.2.1；父模块地板不得落后最新 tag）
