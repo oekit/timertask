@@ -491,7 +491,11 @@ func (b *RedisBackend) LocalPendingCount() int {
 func (b *RedisBackend) taskKey(taskID string) string {
 	shard := 0
 	if len(taskID) > 0 {
-		shard = int(crc32.ChecksumIEEE([]byte(taskID))) % b.buckets
+		// 分片下标必须走 shardIndex（**先在 uint32 空间取模再转 int**）：
+		// 直接写 `int(crc32.ChecksumIEEE(...)) % b.buckets` 在 32 位平台上
+		// 会按位截断成负数 ⇒ 任务被写进 `{timertask.x}.shard.-3` 这样的 key，
+		// 而消费/回扫只扫 shard.0 … shard.N-1 ⇒ 任务永远不会被执行，也不进死信。
+		shard = shardIndex(crc32.ChecksumIEEE([]byte(taskID)), b.buckets)
 	}
 	return fmt.Sprintf(taskKeyPattern, b.buzType, shard)
 }
