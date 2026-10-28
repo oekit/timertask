@@ -2,6 +2,10 @@
 
 由 oekit/timertask v0.2.0 拆分而来（Redis 形态独立成模块）。
 
+## [v0.2.2] — 2026-10-28
+
+- fix(redis): 空任务 ID 不被拒绝（父模块 v0.2.3 新增 `timertask.ErrEmptyTaskID`）——本模块的 `Send` 同步返回该错误；父模块依赖地板 v0.2.1 → v0.2.3
+
 ## [v0.2.1] — 2026-10-20
 
 - build: 父模块依赖地板 v0.2.0 → v0.2.1（跟随 timertask v0.2.1）

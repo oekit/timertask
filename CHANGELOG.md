@@ -2,6 +2,10 @@
 
 由 ekit v0.34.0（git.enjoye.top/enjoydream/ekit，冻结维护）拆分而来。所有 notable 变更记录如下。
 
+## [redis/v0.2.2] — 2026-10-28
+
+- fix(redis): 空任务 ID 不被拒绝（父模块 v0.2.3 新增 `timertask.ErrEmptyTaskID`）——本模块的 `Send` 同步返回该错误；父模块依赖地板 v0.2.1 → v0.2.3
+
 ## [v0.2.3] — 2026-10-28
 
 - fix(timertask): 空任务 ID 不被拒绝——ID 注释写着「任务唯一 ID」，但两个后端都不校验 ⇒ 空 ID 的任务在 local 后端只有第一个入队、其余**静默丢弃**，在 redis 后端则全部入队、各自执行一次。构造期直接报错（新增 `ErrEmptyTaskID`），把「调用方漏填 ID」挡在提交那一刻
