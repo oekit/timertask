@@ -2,6 +2,30 @@
 
 由 ekit v0.34.0（git.enjoye.top/enjoydream/ekit，冻结维护）拆分而来。所有 notable 变更记录如下。
 
+## [redis/v0.2.4] — 2026-10-28
+
+- fix(redis): taskKey 复用已加固的 shardIndex——32 位平台不再产出负分片
+
+`taskKey` 用 `int(crc32.ChecksumIEEE(...)) % b.buckets` 选分片，**没有复用同仓已经加固过的 `shardIndex`** ⇒ 在 **32 位平台**（`GOARCH=386` / `arm`）上 `int(uint32)` 按位截断成负数 ⇒ 分片下标为负 ⇒ 任务被写进 `{timertask.<type>}.shard.-3` 这样的 key，而消费/回扫只扫 `shard.0 … shard.N-1` ⇒ **任务永远不会被执行，也不会进死信**，且不出现在 `PendingCount`（只数合法分片）⇒ 静默丢任务，排障完全无痕迹；at-least-once 模式的租约回扫也写回负分片，同样救不回来。
+
+更值得记的是**护栏失守**：仓里的源码级护栏 `TestShardIndex_NoIntTruncationInSource` **只读 `shard.go`**（对同包的 `redis.go` 完全失明），且匹配的是**字面量** `int(hash)`（真实写法 `int(crc32.ChecksumIEEE([]byte(taskID)))` 匹配不到）⇒ 即使把扫描范围扩到全目录，字面量也匹配不上 ⇒ 「同型缺陷在别的文件里再出现一次」没有任何机制会报。
+
+三处修：① `taskKey` 改走 `shardIndex`（先在 uint32 空间取模再转 int，同仓已有且带注释的正确实现）；② 源码护栏升级为「扫全目录 + **形态匹配**」——找「把哈希值强转成 int」且「取模在转换**之外**」的行（危险形态 `int(crc32...(...)) % n` 命中，安全形态 `int(hash % uint32(n))` 不误伤），且用 `ast` 判定并跳过注释/文档串；③ 补两条行为护栏：5000 个任务 ID 的分片段恒在 `[0, buckets)`，以及旧写法在 32 位平台上确实给出负分片（钉住缺陷本身，避免护栏退化成空转检查）。
+
+另修掉嵌套模块 `redis/retry_semantics_test.go` 两处既有 govet shadow——嵌套模块从不被 CI lint（共享 workflow 的 lint job 只跑仓根，嵌套模块只 build+test）⇒ 这类问题一直隐形（#42）
+
+## [v0.2.4] — 2026-10-28
+
+- fix(redis): taskKey 复用已加固的 shardIndex——32 位平台不再产出负分片
+
+`taskKey` 用 `int(crc32.ChecksumIEEE(...)) % b.buckets` 选分片，**没有复用同仓已经加固过的 `shardIndex`** ⇒ 在 **32 位平台**（`GOARCH=386` / `arm`）上 `int(uint32)` 按位截断成负数 ⇒ 分片下标为负 ⇒ 任务被写进 `{timertask.<type>}.shard.-3` 这样的 key，而消费/回扫只扫 `shard.0 … shard.N-1` ⇒ **任务永远不会被执行，也不会进死信**，且不出现在 `PendingCount`（只数合法分片）⇒ 静默丢任务，排障完全无痕迹；at-least-once 模式的租约回扫也写回负分片，同样救不回来。
+
+更值得记的是**护栏失守**：仓里的源码级护栏 `TestShardIndex_NoIntTruncationInSource` **只读 `shard.go`**（对同包的 `redis.go` 完全失明），且匹配的是**字面量** `int(hash)`（真实写法 `int(crc32.ChecksumIEEE([]byte(taskID)))` 匹配不到）⇒ 即使把扫描范围扩到全目录，字面量也匹配不上 ⇒ 「同型缺陷在别的文件里再出现一次」没有任何机制会报。
+
+三处修：① `taskKey` 改走 `shardIndex`（先在 uint32 空间取模再转 int，同仓已有且带注释的正确实现）；② 源码护栏升级为「扫全目录 + **形态匹配**」——找「把哈希值强转成 int」且「取模在转换**之外**」的行（危险形态 `int(crc32...(...)) % n` 命中，安全形态 `int(hash % uint32(n))` 不误伤），且用 `ast` 判定并跳过注释/文档串；③ 补两条行为护栏：5000 个任务 ID 的分片段恒在 `[0, buckets)`，以及旧写法在 32 位平台上确实给出负分片（钉住缺陷本身，避免护栏退化成空转检查）。
+
+另修掉嵌套模块 `redis/retry_semantics_test.go` 两处既有 govet shadow——嵌套模块从不被 CI lint（共享 workflow 的 lint job 只跑仓根，嵌套模块只 build+test）⇒ 这类问题一直隐形（#42）
+
 ## [redis/v0.2.3] — 2026-10-28
 
 - fix(redis): 分片下标 `int(hash) % len(clients)` 在 **32 位平台**上 uint32→int 截断成负数 ⇒ 负下标越界 panic，分片分配 goroutine 当场死亡（心跳门控还关着 ⇒ 实例静默不消费任务）。修法：先在 uint32 空间取模再转 int
