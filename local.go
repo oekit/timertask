@@ -90,7 +90,16 @@ func NewLocalBackend(handler Handler, opts ...TimerTaskOption) *LocalBackend {
 
 // Send 提交一个延迟任务。
 // task.EndTime（Unix 秒）决定任务何时被执行。
+//
+// 语义：
+//   - task.ID 为空 ⇒ 返回 ErrEmptyTaskID（ID 必须唯一，空 ID 无法区分任务）。
+//   - 同 ID 重复提交 ⇒ **不入队**（先到先得），返回 nil（视为幂等提交成功）。
+//     此前既不报错也不记日志，调用方无法判断本次是否真的入队；现在补一条
+//     日志，让「这次没入队」在日志里可见。
 func (b *LocalBackend) Send(ctx context.Context, task *Task) error {
+	if task.ID == "" {
+		return ErrEmptyTaskID
+	}
 	if task.CreateTime == 0 {
 		task.CreateTime = time.Now().Unix()
 	}
@@ -103,6 +112,7 @@ func (b *LocalBackend) Send(ctx context.Context, task *Task) error {
 
 	// 检查任务是否已存在
 	if _, exists := b.taskMap[task.ID]; exists {
+		logger.Info("task already scheduled, skipped", "taskID", task.ID)
 		return nil
 	}
 

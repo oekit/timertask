@@ -114,6 +114,9 @@ func NewRedisBackend(buzType string, client goredis.UniversalClient, handler tim
 // Send 提交一个延迟任务。
 // task.EndTime（Unix 秒）决定任务何时被执行。
 func (b *RedisBackend) Send(ctx context.Context, task *timertask.Task) error {
+	if task.ID == "" {
+		return timertask.ErrEmptyTaskID
+	}
 	if task.CreateTime == 0 {
 		task.CreateTime = time.Now().Unix()
 	}
