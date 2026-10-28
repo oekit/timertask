@@ -165,7 +165,7 @@ func (s *ShardManager) assignShards(ctx context.Context) {
 	for shard := 0; shard < s.totalShards; shard++ {
 		// 使用 FNV-1a 哈希分配（simpleHash）
 		hash := simpleHash(s.buzType + "-" + strconv.Itoa(shard))
-		idx := int(hash) % len(clients)
+		idx := shardIndex(hash, len(clients))
 		if clients[idx] == s.clientID {
 			myShards = append(myShards, shard)
 		}
@@ -200,4 +200,20 @@ func simpleHash(s string) uint32 {
 	h := fnv.New32a()
 	h.Write([]byte(s))
 	return h.Sum32()
+}
+
+// shardIndex 由哈希值算出客户端下标（取值恒在 [0, n)）。
+//
+// **不能把 uint32 强转成 int 再取模**：32 位平台上 int 是 32 位有符号数，
+// uint32 值大于 MaxInt32 时转换按位截断成**负数**（约一半的概率）⇒
+// 负数取模在 Go 里仍是负数 ⇒ clients[idx] 越界 panic，整个分片分配
+// goroutine 当场死亡（心跳门控还关着 ⇒ 分片永远分配不出来，实例静默
+// 不消费任务）。
+//
+// 修法：先在 uint32 空间取模（结果恒非负），再转 int。
+func shardIndex(hash uint32, n int) int {
+	if n <= 0 {
+		return 0
+	}
+	return int(hash % uint32(n))
 }

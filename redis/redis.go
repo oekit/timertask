@@ -26,6 +26,16 @@ const (
 	deadLetterMaxLen = 10000
 )
 
+// bestEffortTimeout 是「尽力而为」写（死信写入、租约 Ack）的超时上限。
+//
+// 这些调用都发生在**失败/收尾路径**上：业务已经结束，若 Redis 是黑洞
+// （网络分区而非拒连），无 deadline 的调用会挂到 OS 级 TCP 超时
+// （分钟级）⇒ worker goroutine 永不返回 ⇒ worker 池被拖垮、优雅停机卡住。
+// 超窗后按 best-effort 语义放弃（只记日志）。
+//
+// 用 var 而非 const：测试需要把它调小以在毫秒级内复现「黑洞」场景。
+var bestEffortTimeout = 5 * time.Second
+
 // deleteScript Lua 原子删除脚本（原子 claim 消费到的 task）。
 //
 // 条件: task 实际 score (EndTime) <= ARGV[2] (current scan time) 时删除。
@@ -337,7 +347,13 @@ func (b *RedisBackend) processTask(ctx context.Context, c *claim) {
 	defer func() {
 		if terminal && b.delivery == timertask.DeliveryAtLeastOnce {
 			// 成功或已进死信的终态：释放租约。
-			b.ackTask(context.Background(), c.member)
+			// Ack 带限时：它在**收尾路径**上，Redis 黑洞时无界的调用会把
+			// worker 挂住 ⇒ worker 池被拖垮、优雅停机卡住。
+			// 超窗按 best-effort 语义放弃。
+			bestEffortRedis("ack", func(ctx context.Context) error {
+				b.ackTask(ctx, c.member)
+				return nil
+			})
 		}
 	}()
 	// retryTimer lazy init: i=0 直接调 handler，不需要 timer；只有真正进入重试路径
@@ -397,16 +413,50 @@ func (b *RedisBackend) sendToDeadLetter(task *timertask.Task) {
 		log.Error("dead letter marshal failed", "taskID", task.ID, "err", err)
 		return
 	}
-	key := fmt.Sprintf(deadLetterKey, b.buzType)
-	pipe := b.client.Pipeline()
-	pipe.ZAdd(context.Background(), key, goredis.Z{
-		Score:  float64(time.Now().Unix()),
-		Member: string(data),
+	// 死信写入带限时：它在**失败收尾路径**上，若 Redis 是黑洞
+	// （网络分区而非拒连），无界的写会把 worker goroutine 挂住 ⇒
+	// worker 池被拖垮、优雅停机卡住。超窗后按 best-effort 语义放弃。
+	bestEffortRedis("dead_letter", func(ctx context.Context) error {
+		key := fmt.Sprintf(deadLetterKey, b.buzType)
+		pipe := b.client.Pipeline()
+		pipe.ZAdd(ctx, key, goredis.Z{
+			Score:  float64(time.Now().Unix()),
+			Member: string(data),
+		})
+		// 按失败时间只保留最近 deadLetterMaxLen 条
+		pipe.ZRemRangeByRank(ctx, key, 0, -deadLetterMaxLen-1)
+		_, err := pipe.Exec(ctx)
+		return err
 	})
-	// 按失败时间只保留最近 deadLetterMaxLen 条
-	pipe.ZRemRangeByRank(context.Background(), key, 0, -deadLetterMaxLen-1)
-	if _, err := pipe.Exec(context.Background()); err != nil {
-		log.Error("dead letter write failed", "taskID", task.ID, "err", err)
+}
+
+// bestEffortRedis 跑一个「尽力而为」的 Redis 写，最多等 bestEffortTimeout。
+//
+// **为什么不能只靠 ctx deadline**：go-redis 默认**丢弃**调用方的 ctx deadline
+// （Options.ContextTimeoutEnabled 默认为 false ⇒ baseClient.context 返回
+// context.Background()），阻塞读只受客户端自身的 ReadTimeout 约束。调用方把
+// ReadTimeout 调大（长连接场景常见）时，收尾路径上的写会把 worker 挂到
+// ReadTimeout（可到分钟级）⇒ worker 池被拖垮、优雅停机卡住。
+//
+// 这里显式限时：超时即放弃（best-effort 语义：失败只记日志），worker 立刻
+// 回到池里；被放弃的 goroutine 会在客户端自身的 ReadTimeout 到点后自行结束
+// （连接随之归还连接池，不会泄漏）。
+func bestEffortRedis(op string, fn func(ctx context.Context) error) {
+	ctx, cancel := context.WithTimeout(context.Background(), bestEffortTimeout)
+	defer cancel()
+
+	done := make(chan struct{})
+	async.GoSafe(func() {
+		defer close(done)
+		if err := fn(ctx); err != nil {
+			log.Error("best-effort redis write failed", "op", op, "err", err)
+		}
+	})
+
+	select {
+	case <-done:
+	case <-ctx.Done():
+		log.Warn("best-effort redis write timed out, abandoned", "op", op, "timeout", bestEffortTimeout)
 	}
 }
 
