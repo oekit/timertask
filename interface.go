@@ -33,7 +33,17 @@ type Task struct {
 	Param      string `json:"param"`       // 业务参数（JSON 字符串）
 	Extra      string `json:"extra"`       // 扩展字段
 	RetryCount int    `json:"retry_count"` // 已重试次数
-	MaxRetry   int    `json:"max_retry"`   // 最大重试次数
+	// MaxRetry 最大重试次数。三态语义（此前只写「最大重试次数」，调用方
+	// 按字面理解会踩坑）：
+	//
+	//   - == 0：**未指定** ⇒ 后端用自己的默认重试次数（NewBackend 的
+	//     WithRetry 参数，默认 3）。注意这不是「不重试」——想表达「不重试」
+	//     要用负数。
+	//   - > 0：显式重试次数。
+	//   - < 0：**不重试**（只执行一次；worker 侧归一为 0，redis 的租约回扫
+	//     侧同样归一——两条路径口径一致，不会出现「一条路径判耗尽、另一条
+	//     无限重投」的分叉）。
+	MaxRetry int `json:"max_retry"`
 }
 
 // Handler 是任务处理函数。
