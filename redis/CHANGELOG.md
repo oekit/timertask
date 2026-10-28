@@ -2,6 +2,10 @@
 
 由 oekit/timertask v0.2.0 拆分而来（Redis 形态独立成模块）。
 
+## [v0.2.4] — 2026-10-28
+
+- 跟随 timertask v0.2.4 发版（release_train 嵌套 train）
+
 ## [v0.2.3] — 2026-10-28
 
 - fix: 分片下标 `int(hash) % len(clients)` 在 **32 位平台**上 uint32→int 截断成负数 ⇒ 负下标越界 panic，分片分配 goroutine 当场死亡（心跳门控还关着 ⇒ 实例静默不消费任务）。修法：先在 uint32 空间取模再转 int
