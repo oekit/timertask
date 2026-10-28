@@ -2,6 +2,7 @@ package timertask
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 )
@@ -45,6 +46,13 @@ type Task struct {
 	//     无限重投」的分叉）。
 	MaxRetry int `json:"max_retry"`
 }
+
+// ErrEmptyTaskID 表示提交的任务没有 ID。
+//
+// 任务 ID 必须唯一（「ID 任务唯一 ID」），空 ID 无法区分不同任务：local 后端
+// 只会入队第一个、其余静默丢弃；redis 后端则全部入队、各自执行一次。
+// 构造期直接报错，把「调用方漏填 ID」这类接线错误挡在提交那一刻。
+var ErrEmptyTaskID = errors.New("timertask: task ID must not be empty")
 
 // Handler 是任务处理函数。
 type Handler func(ctx context.Context, task *Task) error
