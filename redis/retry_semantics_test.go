@@ -39,7 +39,7 @@ func TestReapExpiredLeases_NegativeMaxRetry_NotInfiniteRequeue(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 租约 score 是到期时刻（已过期 ⇒ score <= now）。
-	if err := client.ZAdd(context.Background(), b.processingKey(), goredis.Z{
+	if err = client.ZAdd(context.Background(), b.processingKey(), goredis.Z{
 		Score:  float64(time.Now().Unix() - 100),
 		Member: string(data),
 	}).Err(); err != nil {
@@ -82,7 +82,7 @@ func TestReapExpiredLeases_PositiveMaxRetry_StillRequeues(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := client.ZAdd(context.Background(), b.processingKey(), goredis.Z{
+	if err = client.ZAdd(context.Background(), b.processingKey(), goredis.Z{
 		Score:  float64(time.Now().Unix() - 100),
 		Member: string(data),
 	}).Err(); err != nil {
