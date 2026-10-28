@@ -318,10 +318,22 @@ func (b *RedisBackend) processTask(ctx context.Context, c *claim) {
 	task := c.task
 	var err error
 	normalizeRetry(task)
+	// terminal 标记「本次处理已到终态」（成功 / 已进死信）——只有终态才 Ack 租约。
+	//
+	// 此前 defer 里的 Ack 在**每条**返回路径上都执行，包括「重试窗口内被
+	// 中断」（ctx 取消 / 停机）那条——与同处注释「仅 handler 仍在重试窗口内
+	// 不 Ack」直接矛盾。后果是任务**永久丢失**：任务已被 claim 出分片 ZSet
+	// 移进 processing 租约集，租约是它唯一的去处，释放了它，任务就落到
+	// 「哪都不是」的地方（不在分片 ZSet、不在 processing、不在死信 ZSet），
+	// 租约回扫（reapExpiredLeases）也捞不回来 ⇒ at-least-once 承诺失效
+	// （doc.go 声明的「租约超时由回扫重投」形同虚设）。
+	//
+	// 中断时**不** Ack：租约留在 processing 里，由 reapExpiredLeases（租约到期）
+	// 或 requeueLeasesOnShutdown（停机）捡回重投。
+	terminal := false
 	defer func() {
-		if b.delivery == timertask.DeliveryAtLeastOnce {
-			// 成功或已进死信的终态：释放租约；仅 handler 仍在重试窗口内不 Ack。
-			// 本函数返回即终态（成功 return / 死信+onFailure）。
+		if terminal && b.delivery == timertask.DeliveryAtLeastOnce {
+			// 成功或已进死信的终态：释放租约。
 			b.ackTask(context.Background(), c.member)
 		}
 	}()
@@ -357,6 +369,7 @@ func (b *RedisBackend) processTask(ctx context.Context, c *claim) {
 		// 收编后走既有重试 + sendToDeadLetter 路径。
 		err = runHandlerSafe(ctx, b.handler, task)
 		if err == nil {
+			terminal = true
 			return
 		}
 		log.Error("handler error", "taskID", task.ID, "err", err)
@@ -368,6 +381,8 @@ func (b *RedisBackend) processTask(ctx context.Context, c *claim) {
 	if b.onFailure != nil {
 		b.onFailure(task, err)
 	}
+	// 终态（已进死信）：租约可以释放。
+	terminal = true
 }
 
 // sendToDeadLetter 将重试耗尽的任务写入持久死信 ZSet（score 为失败时间戳），
