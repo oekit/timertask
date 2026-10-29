@@ -8,7 +8,7 @@
 ## 安装
 
 ```bash
-go get github.com/oekit/timertask@v0.2.4
+go get github.com/oekit/timertask@v0.2.5
 # 需要 Redis 形态（嵌套模块，按需引入）：
 go get github.com/oekit/timertask/redis@v0.2.0
 ```
