@@ -2,6 +2,14 @@
 
 由 ekit v0.34.0（git.enjoye.top/enjoydream/ekit，冻结维护）拆分而来。所有 notable 变更记录如下。
 
+## [redis/v0.2.5] — 2026-10-29
+
+- build: 依赖地板对齐——concurrency 抬到 v0.23.2
+
+## [v0.2.5] — 2026-10-29
+
+- build: 依赖地板对齐——concurrency 抬到 v0.23.2
+
 ## [redis/v0.2.4] — 2026-10-28
 
 - fix(redis): taskKey 复用已加固的 shardIndex——32 位平台不再产出负分片
