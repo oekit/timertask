@@ -79,7 +79,7 @@
   ——**这句是错的**：`timertask/redis` 不是根包下的子目录，它是**独立的 Go module**
   （有自己的 go.mod、自己的 tag `redis/v0.2.0`）。消费方只改 import 路径、**不新增 require 行**，
   会直接构建失败（`no required module provides package github.com/oekit/timertask/redis`）
-- 正确的迁移步骤（**新增 require 是必需的一步**）：
+- #19：正确的迁移步骤（**新增 require 是必需的一步**）：
 
   ```bash
   go get github.com/oekit/timertask/redis@v0.2.0
@@ -97,7 +97,7 @@
 ## [v0.2.0] — 2026-10-19
 
 ### Breaking
-- **Redis 后端迁至嵌套模块**：`RedisBackend`/`NewRedisBackend`/`ShardManager`/`NewShardManager`
+- #14：**Redis 后端迁至嵌套模块**：`RedisBackend`/`NewRedisBackend`/`ShardManager`/`NewShardManager`
   从根包移除，改用 `github.com/oekit/timertask/redis`（**API 不变，但 import 路径与 go.mod
   require 两处都要改**——`timertask/redis` 是**独立 module**，需 `go get
   github.com/oekit/timertask/redis@v0.2.0` 新增 require 行；详见 v0.2.1 的迁移步骤）；

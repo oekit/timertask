@@ -13,6 +13,7 @@
 ## [v0.2.4] — 2026-10-28
 
 - 跟随 timertask v0.2.4 发版（release_train 嵌套 train）
+- #42：fix(redis): `taskKey` 复用已加固的 `shardIndex`——32 位平台不再把任务写进负分片的 key
 
 ## [v0.2.3] — 2026-10-28
 
