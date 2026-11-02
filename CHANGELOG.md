@@ -2,6 +2,18 @@
 
 由 ekit v0.34.0（git.enjoye.top/enjoydream/ekit，冻结维护）拆分而来。所有 notable 变更记录如下。
 
+## [redis/v0.2.7] — 2026-11-03
+
+- build: 把父仓 timertask v0.2.7 与 concurrency v0.23.3、logx v0.8.2 的地板带进已发布产物（redis/v0.2.6 的快照嵌的是 concurrency v0.23.2、logx v0.8.0，消费方拿不到新内容）（timertask#68）
+
+关联问题单：timertask#68。
+
+## [v0.2.7] — 2026-11-03
+
+- build: 把父仓 timertask v0.2.7 与 concurrency v0.23.3、logx v0.8.2 的地板带进已发布产物（redis/v0.2.6 的快照嵌的是 concurrency v0.23.2、logx v0.8.0，消费方拿不到新内容）（timertask#68）
+
+关联问题单：timertask#68。
+
 ## [redis/v0.2.6] — 2026-11-02
 
 - build: 矩阵内依赖地板 `pkg` v0.31.0 → v0.31.1（维护轮全量对齐；本版不含 API 变更）
