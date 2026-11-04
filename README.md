@@ -8,7 +8,7 @@
 ## 安装
 
 ```bash
-go get github.com/oekit/timertask@v0.2.7
+go get github.com/oekit/timertask@v0.2.8
 # 需要 Redis 形态（嵌套模块，按需引入）：
 go get github.com/oekit/timertask/redis@v0.2.0
 ```
@@ -68,7 +68,7 @@ go get github.com/oekit/timertask/redis@v0.2.0   # ① go.mod 新增 require（�
 // ② import 路径
 import "github.com/oekit/timertask/redis"
 
-backend := redis.New(redis.RedisConfig{...})   // API 不变
+backend := redis.NewRedisBackend("buzType", goredisClient, handler, opts...) // API 不变（#73 修正示例）
 ```
 
 只改 import 路径而漏掉 ①，会构建失败（`no required module provides package

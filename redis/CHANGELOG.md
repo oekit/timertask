@@ -2,6 +2,14 @@
 
 由 oekit/timertask v0.2.0 拆分而来（Redis 形态独立成模块）。
 
+## [redis/v0.2.8] — 2026-11-05
+
+- 跟随 timertask v0.2.8 发版（release_train 嵌套 train）；内容 = 本文件 v0.2.8 条目的迁移示例修正
+
+## [v0.2.8] — 2026-11-05
+
+- docs: v0.2.0 迁移示例修正（[#73](https://github.com/oekit/timertask/issues/73)）——初版示例的两行 API 都是编造的（`timertask.RedisConfig` 结构体从未存在、本包没有 `func New(`），照抄必编译失败；真实签名两侧同形：`NewRedisBackend(buzType string, client goredis.UniversalClient, handler timertask.Handler, opts ...timertask.TimerTaskOption)`。同时把「import 路径替换即可」统一成「import 路径 + go.mod require 两处都要改」（本模块是独立 module，漏 require 报 `no required module provides package`）。历史条目就地修正（tag 内文本不可改），本条目供升级可见
+
 ## [v0.2.7] — 2026-11-03
 
 - 跟随 timertask v0.2.7 发版（release_train 嵌套 train）（timertask#68）
@@ -38,13 +46,15 @@
 
 ### Breaking
 - **从根包迁出**：`RedisBackend`/`NewRedisBackend`/`ShardManager`/`NewShardManager` 原位于
-  `github.com/oekit/timertask` 根包，v0.2.0 起迁至本模块——import 路径替换即可，API 不变：
+  `github.com/oekit/timertask` 根包，v0.2.0 起迁至本模块——**import 路径与 go.mod require
+  两处都要改**（本模块是独立 module，须 `go get github.com/oekit/timertask/redis@v0.2.0`
+  新增 require 行；#73 修正：初版此处的「import 路径替换即可」与示例 API 均有误）：
 
   ```go
-  // 旧
-  backend := timertask.NewRedisBackend(timertask.RedisConfig{...})
-  // 新
-  backend := redis.New(redis.RedisConfig{...})
+  // 旧（timertask v0.1.10，根包）
+  backend := timertask.NewRedisBackend("buzType", goredisClient, handler, opts...)
+  // 新（timertask/redis 模块；import 路径 + go.mod require 两处都要改）
+  backend := redis.NewRedisBackend("buzType", goredisClient, handler, opts...)
   ```
 
   根包保留 `Task`/`Handler`/全部 `With*` 选项与 `LocalBackend`，既有本地形态调用点一行不动。
