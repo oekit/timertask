@@ -65,8 +65,14 @@ func TestAtLeastOnce_LeaseExpireRequeue(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// 直接 claim 进租约集（模拟 worker 拿到后进程崩溃，未 Ack）
-	ok, err := b.claimTaskWithLease(context.Background(), b.taskKey(task.ID), mustJSON(task), time.Now().Unix())
+	// 直接 claim 进租约集（模拟 worker 拿到后进程崩溃，未 Ack）。
+	// member 从 ZSet 读真实条目——与生产一致（member 由 Send 规范化写入，
+	// 测试不可自造逐字节副本，CreateTime 钉死即对不上）
+	member, err := b.client.ZRange(context.Background(), b.taskKey(task.ID), 0, 0).Result()
+	if err != nil || len(member) != 1 {
+		t.Fatalf("read member: %v (%d)", err, len(member))
+	}
+	ok, err := b.claimTaskWithLease(context.Background(), b.taskKey(task.ID), member[0], time.Now().Unix())
 	if err != nil || !ok {
 		t.Fatalf("claim: ok=%v err=%v", ok, err)
 	}
@@ -75,7 +81,7 @@ func TestAtLeastOnce_LeaseExpireRequeue(t *testing.T) {
 	past := time.Now().Unix() - 10
 	if err = b.client.ZAdd(context.Background(), b.processingKey(), goredis.Z{
 		Score:  float64(past),
-		Member: mustJSON(task),
+		Member: member[0],
 	}).Err(); err != nil {
 		t.Fatal(err)
 	}

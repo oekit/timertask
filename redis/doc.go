@@ -53,6 +53,15 @@
 //     score 为失败时间戳，默认保留最近 10000 条）；WithOnFailure 回调
 //     只是死信之外的进程内通知手段，不构成持久化。
 //
+// # 提交与撤销
+//
+//   - Send 的 ZSet member 是任务的规范化 JSON（CreateTime 钉为 EndTime）：
+//     同一任务同一 fire_ts 拍两次 Send = 同 member = ZSet 单条（ZAdd 更新
+//     score 而非新增），「同拍重发不双跑」是库内不变量。副作用：消费侧
+//     task.CreateTime == task.EndTime，需要真创建时刻的调用方自存业务字段。
+//   - Remove(taskID, fireTS) 撤销尚未触发的条目（幂等，返回撤销数）；已
+//     claim / 重试中 / 已进死信的任务不受影响——撤销要赶在 fireTS 之前。
+//
 // 哪种任务选哪种模式：
 //
 //   - 提醒/审计/计费等不可丢事件 → DeliveryAtLeastOnce + 调用方幂等；
