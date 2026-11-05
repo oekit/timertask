@@ -2,6 +2,14 @@
 
 由 ekit v0.34.0（git.enjoye.top/enjoydream/ekit，冻结维护）拆分而来。所有 notable 变更记录如下。
 
+## [redis/v0.2.10] — 2026-11-06
+
+- build: 矩阵依赖地板对齐（维护轮 #233）
+
+## [v0.2.9] — 2026-11-06
+
+- build: 矩阵依赖地板对齐（维护轮 #233）
+
 ## [v0.2.8] — 2026-11-05
 
 - docs: v0.2.0/v0.2.1 迁移示例修正（[#73](https://github.com/oekit/timertask/issues/73)）——示例的两行 API 都是编造的（`timertask.RedisConfig` 结构体从未存在——v0.1.10 真实签名是 `NewRedisBackend(buzType string, client redis.UniversalClient, handler Handler, opts ...TimerTaskOption)`；redis 包没有 `func New(`——v0.2.x 真实签名是 `redis.NewRedisBackend(buzType string, client goredis.UniversalClient, handler timertask.Handler, opts ...timertask.TimerTaskOption)`），照抄必编译失败（bianque 升级实录：读示例不够、还得去 module cache 读真实签名才迁成功）。历史条目就地修正为真实签名；redis 子模块的「import 路径替换即可」同步统一成「import 路径 + go.mod require 两处都要改」。仅文档修正，无代码变更
