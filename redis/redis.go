@@ -123,6 +123,15 @@ func NewRedisBackend(buzType string, client goredis.UniversalClient, handler tim
 
 // Send 提交一个延迟任务。
 // task.EndTime（Unix 秒）决定任务何时被执行。
+//
+// ZSet member 是任务的**规范化 JSON**：CreateTime 钉为 EndTime（#75）——此前
+// member 是 task 的原样序列化，而 Send 缺省给 CreateTime 填 now，同一任务同
+// fire_ts 拍两次 Send ⇒ CreateTime 不同 ⇒ member 不同 ⇒ ZSet 两条 ⇒ **双跑**。
+// 规范化后「同拍重发 = 同 member」（ZAdd 同 member 更新 score 而非新增条目），
+// 去重从调用方纪律（下游被迫钉死 CreateTime=EndTime 换字节一致）下沉为库内
+// 不变量。语义副作用：消费侧拿到的 task.CreateTime == task.EndTime——「创建
+// 时刻」在 ZSet member 语义里不再存在，需要真创建时刻的调用方自存（业务字段）。
+// 调用方传入的 task 结构体行为不变（CreateTime==0 仍被就地补 now）。
 func (b *RedisBackend) Send(ctx context.Context, task *timertask.Task) error {
 	if task.ID == "" {
 		return timertask.ErrEmptyTaskID
@@ -133,7 +142,11 @@ func (b *RedisBackend) Send(ctx context.Context, task *timertask.Task) error {
 	if task.MaxRetry == 0 {
 		task.MaxRetry = b.retryCount
 	}
-	data, err := json.Marshal(task)
+	// 规范化 member：拷贝后钉 CreateTime=EndTime（Task 全为值字段，浅拷贝安全）；
+	// 其余字段与调用方输入逐字节一致——两次 Send 同参 ⇒ 同 member。
+	c := *task
+	c.CreateTime = task.EndTime
+	data, err := json.Marshal(&c)
 	if err != nil {
 		return fmt.Errorf("timertask: marshal task: %w", err)
 	}
@@ -148,6 +161,51 @@ func (b *RedisBackend) Send(ctx context.Context, task *timertask.Task) error {
 	}
 	log.Info("task scheduled", "taskID", task.ID, "endTime", task.EndTime)
 	return nil
+}
+
+// Remove 撤销一个已提交、**尚未触发**的延迟任务（#75）。
+// 返回实际撤销的条数（0 = 无匹配的待触发条目，幂等可重入）。
+//
+// 实现按 (taskID → 分片 key，fireTS → score 精确窗口) 扫描：member 是任务全量
+// JSON（含业务字段），调用方只有 (ID, fireTS) 无法逐字节重建 member，故用
+// 「score 精确窗口（ZRangeByScore min=max）+ 解析比对 task_id」定位后 ZRem——
+// 窗口内条目数 = 该分片同一秒到期的任务数，量级可忽略。
+//
+// 语义边界：
+//   - 只覆盖「尚未被消费扫描 claim」的条目；已 claim / 本地队列 / 重试中 / 已进
+//     死信的任务不受影响（撤销要赶在 fireTS 之前——窗口期语义即本 API 的存在理由）；
+//   - 与消费扫描竞态（fireTS ± 扫描周期）：先到者得——Remove 赢 = 任务不触发；
+//     claim 赢 = 正常触发（返回 0）；
+//   - 历史格式 member（旧版全量 JSON、CreateTime≠EndTime）解析不受影响，
+//     一样按 ID 匹配可撤销。
+func (b *RedisBackend) Remove(ctx context.Context, taskID string, endTS int64) (int64, error) {
+	if taskID == "" {
+		return 0, timertask.ErrEmptyTaskID
+	}
+	key := b.taskKey(taskID)
+	members, err := b.client.ZRangeByScore(ctx, key, &goredis.ZRangeBy{
+		Min: strconv.FormatInt(endTS, 10),
+		Max: strconv.FormatInt(endTS, 10),
+	}).Result()
+	if err != nil {
+		return 0, fmt.Errorf("timertask: ZRANGEBYSCORE %s: %w", key, err)
+	}
+	var removed int64
+	for _, m := range members {
+		t := b.parseTask(m)
+		if t == nil || t.ID != taskID {
+			continue
+		}
+		n, err := b.client.ZRem(ctx, key, m).Result()
+		if err != nil {
+			return removed, fmt.Errorf("timertask: ZREM %s: %w", key, err)
+		}
+		removed += n
+	}
+	if removed > 0 {
+		log.Info("task removed", "taskID", taskID, "endTime", endTS, "removed", removed)
+	}
+	return removed, nil
 }
 
 // Start 启动任务消费（阻塞）。

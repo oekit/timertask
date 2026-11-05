@@ -2,6 +2,15 @@
 
 由 oekit/timertask v0.2.0 拆分而来（Redis 形态独立成模块）。
 
+## [redis/v0.2.9] — 2026-11-06
+
+- fix(redis): ZSet member 规范化——同拍重发不双跑（[#75](https://github.com/oekit/timertask/issues/75) ②）——member 此前是 task 原样序列化，而 Send 缺省给 CreateTime 填 now：同一任务同 fire_ts 拍两次 Send ⇒ CreateTime 不同 ⇒ member 不同 ⇒ ZSet 两条 ⇒ **双跑**。下游被迫在调用点钉死 `CreateTime = EndTime` 造字节一致换幂等，且这个坑只有读实现才知道（接口面零提示）。修法：member 改为规范化 JSON（拷贝后 CreateTime=EndTime，其余字段逐字节同输入），「同拍重发 = 同 member」成为库内不变量（ZAdd 同 member 更新 score 而非新增条目）。**行为副作用（升级可见）**：消费侧拿到的 `task.CreateTime == task.EndTime`——「创建时刻」在 ZSet member 语义里不再存在，需要真创建时刻的调用方自存业务字段；已钉 CreateTime=EndTime 的调用方（如 bianque）数值不变，钉死纪律可以退役。历史格式 member（CreateTime≠EndTime）解析不受影响，照常消费
+- feat(redis): 新增 `Remove(ctx, taskID, endTS) (int64, error)` 撤约 API（[#75](https://github.com/oekit/timertask/issues/75) ①）——全包此前无 Remove/Cancel：业务侧停用/删除规则时无法即时撤约，只能到点触发后靠回调自校验收敛，窗口期内任务照跑（到点必空转一次）。实现按 (taskID → 分片 key，fireTS → score 精确窗口) 扫描匹配后 ZRem，幂等可重入（0 = 无匹配），未知任务无错返回 0。语义边界：只覆盖尚未被消费扫描 claim 的条目，与消费竞态时先到者得（Remove 赢=不触发；claim 赢=正常触发返回 0）；已 claim / 重试中 / 已进死信的任务不受影响
+
+关联问题单：timertask#75。
+
+## [redis/v0.2.8] — 2026-11-05
+
 ## [redis/v0.2.8] — 2026-11-05
 
 - 跟随 timertask v0.2.8 发版（release_train 嵌套 train）；内容 = 本文件 v0.2.8 条目的迁移示例修正
