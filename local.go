@@ -272,4 +272,3 @@ func (b *LocalBackend) PendingCount(ctx context.Context) (int64, error) {
 func (b *LocalBackend) LocalPendingCount() int {
 	return len(b.localQueue)
 }
-
