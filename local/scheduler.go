@@ -376,9 +376,15 @@ func (s *Scheduler) execute(e *entry, at time.Time) {
 		ctx = context.Background()
 	}
 
+	// sem 阻塞可被 stopCh 唤醒（#79）：此前 execute 只监听 sem 与 Start 传入的
+	// ctx——Start 用不可取消 ctx（生产常态）时，配额占满后到达的任务阻塞在
+	// sem 上，Stop 触发 stopCh 却叫不醒它：进程想快速退出，runner 却卡在
+	// 配额闸上无期限等待。
 	select {
 	case s.sem <- struct{}{}:
 	case <-ctx.Done():
+		return
+	case <-s.stopCh:
 		return
 	}
 	defer func() { <-s.sem }()
