@@ -10,6 +10,13 @@
 
 - build: 矩阵依赖地板对齐（维护轮 #233）
 
+## [v0.2.10] — 2026-11-06
+
+- feat: `WithClock(Clock)` 时钟注入——`LocalBackend` 的时间判断（CreateTime 缺省、扫描触发点）改走注入时钟（[#78](https://github.com/oekit/timertask/issues/78)）：同模块 `local/scheduler` 早已提供 Clock 注入（FakeClock 确定性测试），而 LocalBackend 三处硬编码 `time.Now()`——同模块两个 local 形态对可测试时钟的态度相反且未声明，时钟敏感逻辑（租约/过期判定）实际不可测。修法：根包新增 `Clock` 接口（Now）+ `SystemClock`，`WithClock` 注入（nil 取 SystemClock）；local.Clock 改别名嵌入根定义（单一事实源，保留调度器需要的 After）。回归：FakeClock 拨到触发点之后扫描即触发，不真睡
+- fix(local): `Scheduler.execute` 的 sem 阻塞可被 stopCh 唤醒（[#79](https://github.com/oekit/timertask/issues/79)）——此前 select 只监听 sem 与 Start 传入的 ctx：Start 用不可取消 ctx（生产常态）时，并发配额占满后到达的任务阻塞在 sem 上，`Stop` 触发 stopCh 却叫不醒它——关停面留尾巴：进程想快速退出，却有 runner 卡在配额闸上无期限等待。修法：select 并入 stopCh（停止信号优先，直接返回不执行该轮）
+
+关联问题单：timertask#78、timertask#79。
+
 ## [v0.2.9] — 2026-11-06
 
 - build: 矩阵依赖地板对齐（维护轮 #233）

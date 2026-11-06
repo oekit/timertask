@@ -110,6 +110,20 @@ const (
 )
 
 // config 是延迟任务的通用配置。
+// Clock 是时钟抽象（[#78](https://github.com/oekit/timertask/issues/78)）：
+// LocalBackend 的时间判断走本接口，注入假时钟后「到点触发」场景不必真睡即可
+// 断言。与 local.Clock 同形（local 经别名归一到本定义，单一事实源）。
+type Clock interface {
+	// Now 返回当前时间。
+	Now() time.Time
+}
+
+// SystemClock 是真实时钟。
+type SystemClock struct{}
+
+// Now 实现 Clock。
+func (SystemClock) Now() time.Time { return time.Now() }
+
 type config struct {
 	workers           int
 	retryCount        int
@@ -118,6 +132,17 @@ type config struct {
 	onFailure         func(*Task, error) // 任务最终失败回调（通知用途；持久死信由 RedisBackend 自动写入）
 	delivery          DeliveryMode
 	visibilityTimeout time.Duration // 仅 DeliveryAtLeastOnce：processing 租约时长
+	clock             Clock         // 时钟注入（#78）：nil 取 SystemClock{}——对齐 local/scheduler 的 Clock 形态
+}
+
+// WithClock 注入时钟（[#78](https://github.com/oekit/timertask/issues/78)）：
+// LocalBackend 的时间判断（CreateTime 缺省、扫描触发点）改走注入时钟，测试
+// 可注入 FakeClock 断言「到点触发」而不必真睡。nil/缺省取 SystemClock{}。
+// 与 local/scheduler 的 Clock 注入同一形态（此前同模块两形态两套哲学）。
+func WithClock(clock Clock) TimerTaskOption {
+	return func(c *config) {
+		c.clock = clock
+	}
 }
 
 // TimerTaskOption 配置延迟任务的可选参数（函数选项模式）。

@@ -3,15 +3,19 @@ package local
 import (
 	"sync"
 	"time"
+
+	"github.com/oekit/timertask"
 )
 
 // Clock 是时钟抽象，便于注入假时钟做确定性测试。
 //
 // 调度器的所有时间判断都走本接口：注册时的基准时间、触发点计算、等待下一个
 // 触发点。注入 FakeClock 后，整个调度过程不需要 sleep 即可断言触发序列。
+// Clock 是时钟抽象（别名归一到根包 timertask.Clock——单一事实源，#78）。
+// 本调度器还需要 After（等待下一个触发点），根包接口不含该方法 ⇒ 保留本包
+// 扩展接口，嵌入根包定义。
 type Clock interface {
-	// Now 返回当前时间。
-	Now() time.Time
+	timertask.Clock
 	// After 返回一个通道：在 d 之后收到一个时间信号。
 	// d <= 0 时必须返回「已就绪」的通道（调用方据此立即重算，不空等）。
 	After(d time.Duration) <-chan time.Time

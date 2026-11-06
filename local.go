@@ -54,6 +54,7 @@ type LocalBackend struct {
 	retryCount int
 	retryDelay time.Duration
 	onFailure  func(*Task, error)
+	clock      Clock // #78：时间判断单源；nil 取 SystemClock{}
 
 	// 优先队列
 	mu      sync.Mutex
@@ -71,12 +72,17 @@ type LocalBackend struct {
 //   - handler: 任务处理函数
 func NewLocalBackend(handler Handler, opts ...TimerTaskOption) *LocalBackend {
 	cfg := applyOptions(opts)
+	clock := cfg.clock
+	if clock == nil {
+		clock = SystemClock{}
+	}
 	b := &LocalBackend{
 		handler:    handler,
 		workers:    cfg.workers,
 		retryCount: cfg.retryCount,
 		retryDelay: cfg.retryDelay,
 		onFailure:  cfg.onFailure,
+		clock:      clock,
 		queue:      make(priorityQueue, 0),
 		taskMap:    make(map[string]*localTaskItem),
 		localQueue: make(chan *Task, 10000),
@@ -101,7 +107,7 @@ func (b *LocalBackend) Send(ctx context.Context, task *Task) error {
 		return ErrEmptyTaskID
 	}
 	if task.CreateTime == 0 {
-		task.CreateTime = time.Now().Unix()
+		task.CreateTime = b.now().Unix()
 	}
 	if task.MaxRetry == 0 {
 		task.MaxRetry = b.retryCount
@@ -164,8 +170,11 @@ func (b *LocalBackend) scanLoop(ctx context.Context) {
 	}
 }
 
+// now 返回当前时间（#78 时钟注入单源）。
+func (b *LocalBackend) now() time.Time { return b.clock.Now() }
+
 func (b *LocalBackend) scanOnce(ctx context.Context) {
-	now := time.Now().Unix()
+	now := b.now().Unix()
 
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -263,3 +272,4 @@ func (b *LocalBackend) PendingCount(ctx context.Context) (int64, error) {
 func (b *LocalBackend) LocalPendingCount() int {
 	return len(b.localQueue)
 }
+
