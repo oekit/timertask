@@ -48,8 +48,10 @@ func TestRedisBackend_Send(t *testing.T) {
 	if err := b.Send(ctx, task); err != nil {
 		t.Fatal(err)
 	}
-	if task.CreateTime == 0 {
-		t.Error("expected Send to set CreateTime")
+	// #97：Send 不就地改写调用方 Task——缺省补齐落在内部副本上，
+	// 调用方对象保持提交原样（本断言此前钉的是 #97 移除的改写行为）。
+	if task.CreateTime != 0 {
+		t.Error("Send must not mutate caller CreateTime (#97)")
 	}
 	if task.MaxRetry != 0 {
 		t.Error("expected MaxRetry to default to 0 (retryCount=0)")
@@ -90,6 +92,9 @@ func TestRedisBackend_Send_Distribution(t *testing.T) {
 	}
 }
 
+// TestRedisBackend_Send_SetsDefaults 钉住 #97 后的口径：MaxRetry 缺省补齐
+// 落在 ZSet member（内部副本）里，不再就地改写调用方 Task——调用方对象
+// 的 MaxRetry 保持 0（未指定），消费侧拿到的任务才带补齐后的 3。
 func TestRedisBackend_Send_SetsDefaults(t *testing.T) {
 	mr := miniredis.RunT(t)
 	c := goredis.NewClient(&goredis.Options{Addr: mr.Addr()})
@@ -114,11 +119,20 @@ func TestRedisBackend_Send_SetsDefaults(t *testing.T) {
 	if err := b.Send(context.Background(), task); err != nil {
 		t.Fatal(err)
 	}
-	if task.MaxRetry != 3 {
-		t.Errorf("expected MaxRetry=3, got %d", task.MaxRetry)
+	if task.MaxRetry != 0 {
+		t.Errorf("Send must not mutate caller MaxRetry (#97), got %d", task.MaxRetry)
 	}
-	if task.CreateTime == 0 {
-		t.Error("expected CreateTime to be set")
+	if task.CreateTime != 0 {
+		t.Errorf("Send must not mutate caller CreateTime (#97), got %d", task.CreateTime)
+	}
+	// member（内部副本）里 MaxRetry 应为补齐后的 3。
+	members, err := c.ZRange(context.Background(), b.taskKey("defaults-1"), 0, -1).Result()
+	if err != nil || len(members) != 1 {
+		t.Fatalf("read member: %v (%d)", err, len(members))
+	}
+	got := b.parseTask(members[0])
+	if got == nil || got.MaxRetry != 3 {
+		t.Errorf("member MaxRetry = %+v, want 3（缺省补齐落在入队副本上）", got)
 	}
 }
 

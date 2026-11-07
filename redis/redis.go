@@ -131,21 +131,22 @@ func NewRedisBackend(buzType string, client goredis.UniversalClient, handler tim
 // 去重从调用方纪律（下游被迫钉死 CreateTime=EndTime 换字节一致）下沉为库内
 // 不变量。语义副作用：消费侧拿到的 task.CreateTime == task.EndTime——「创建
 // 时刻」在 ZSet member 语义里不再存在，需要真创建时刻的调用方自存（业务字段）。
-// 调用方传入的 task 结构体行为不变（CreateTime==0 仍被就地补 now）。
+//
+// #97：不改写调用方的 Task——CreateTime/MaxRetry 的缺省补齐与 member 规范化
+// 都落在内部副本上（Task 全为值字段，浅拷贝即全量拷贝），调用方提交后继续
+// 读/复用自己的 Task 结构不会看到字段被引擎改写。
 func (b *RedisBackend) Send(ctx context.Context, task *timertask.Task) error {
 	if task.ID == "" {
 		return timertask.ErrEmptyTaskID
 	}
-	if task.CreateTime == 0 {
-		task.CreateTime = time.Now().Unix()
-	}
-	if task.MaxRetry == 0 {
-		task.MaxRetry = b.retryCount
-	}
-	// 规范化 member：拷贝后钉 CreateTime=EndTime（Task 全为值字段，浅拷贝安全）；
+	// 规范化 member：拷贝后补 MaxRetry 缺省、钉 CreateTime=EndTime
+	// （CreateTime 的补 now 随 #75 的钉死早已到不了 member，随 #97 一并移除）；
 	// 其余字段与调用方输入逐字节一致——两次 Send 同参 ⇒ 同 member。
 	c := *task
-	c.CreateTime = task.EndTime
+	if c.MaxRetry == 0 {
+		c.MaxRetry = b.retryCount
+	}
+	c.CreateTime = c.EndTime
 	data, err := json.Marshal(&c)
 	if err != nil {
 		return fmt.Errorf("timertask: marshal task: %w", err)
