@@ -2,6 +2,28 @@
 
 由 ekit v0.34.0（git.enjoye.top/enjoydream/ekit，冻结维护）拆分而来。所有 notable 变更记录如下。
 
+## [redis/v0.2.14] — 2026-11-07
+
+- fix(local): scanOnce 锁内只弹出到期任务、发送移到锁外——满队列+慢 handler 不再整体卡死 Send/PendingCount（#92 #94）
+- fix(redis): at-least-once 租约按 visibilityTimeout/3 周期续期——慢 handler 不再被回扫必现重复投递（#93 #95）
+- fix(redis): 停机窗口 claim-入队间隙的任务回灌 Redis——at-most-once 静默丢弃兜底失效关闭（#96）
+- fix(send): 两个后端 Send 均入队前深拷贝 Task——不再原地改写调用方 MaxRetry/CreateTime（#97）
+- fix(local): 同 ID 去重覆盖排队态与执行窗口——inflight 集合占用，处理结束后可重新提交（#98）
+- fix(scheduler): Stop 触发的正常停机 Start 返回 nil、ctx 取消返回 ctx.Err()——优雅停机不再被伪装成失败（#99）
+
+关联问题单：timertask#92、timertask#93、timertask#94、timertask#95、timertask#96、timertask#97、timertask#98、timertask#99。
+
+## [v0.2.12] — 2026-11-07
+
+- fix(local): scanOnce 锁内只弹出到期任务、发送移到锁外——满队列+慢 handler 不再整体卡死 Send/PendingCount（#92 #94）
+- fix(redis): at-least-once 租约按 visibilityTimeout/3 周期续期——慢 handler 不再被回扫必现重复投递（#93 #95）
+- fix(redis): 停机窗口 claim-入队间隙的任务回灌 Redis——at-most-once 静默丢弃兜底失效关闭（#96）
+- fix(send): 两个后端 Send 均入队前深拷贝 Task——不再原地改写调用方 MaxRetry/CreateTime（#97）
+- fix(local): 同 ID 去重覆盖排队态与执行窗口——inflight 集合占用，处理结束后可重新提交（#98）
+- fix(scheduler): Stop 触发的正常停机 Start 返回 nil、ctx 取消返回 ctx.Err()——优雅停机不再被伪装成失败（#99）
+
+关联问题单：timertask#92、timertask#93、timertask#94、timertask#95、timertask#96、timertask#97、timertask#98、timertask#99。
+
 ## [redis/v0.2.13] — 2026-11-06
 
 - build: 矩阵依赖地板对齐（第二轮发版后置）
