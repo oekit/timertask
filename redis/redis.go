@@ -131,21 +131,22 @@ func NewRedisBackend(buzType string, client goredis.UniversalClient, handler tim
 // 去重从调用方纪律（下游被迫钉死 CreateTime=EndTime 换字节一致）下沉为库内
 // 不变量。语义副作用：消费侧拿到的 task.CreateTime == task.EndTime——「创建
 // 时刻」在 ZSet member 语义里不再存在，需要真创建时刻的调用方自存（业务字段）。
-// 调用方传入的 task 结构体行为不变（CreateTime==0 仍被就地补 now）。
+//
+// #97：不改写调用方的 Task——CreateTime/MaxRetry 的缺省补齐与 member 规范化
+// 都落在内部副本上（Task 全为值字段，浅拷贝即全量拷贝），调用方提交后继续
+// 读/复用自己的 Task 结构不会看到字段被引擎改写。
 func (b *RedisBackend) Send(ctx context.Context, task *timertask.Task) error {
 	if task.ID == "" {
 		return timertask.ErrEmptyTaskID
 	}
-	if task.CreateTime == 0 {
-		task.CreateTime = time.Now().Unix()
-	}
-	if task.MaxRetry == 0 {
-		task.MaxRetry = b.retryCount
-	}
-	// 规范化 member：拷贝后钉 CreateTime=EndTime（Task 全为值字段，浅拷贝安全）；
+	// 规范化 member：拷贝后补 MaxRetry 缺省、钉 CreateTime=EndTime
+	// （CreateTime 的补 now 随 #75 的钉死早已到不了 member，随 #97 一并移除）；
 	// 其余字段与调用方输入逐字节一致——两次 Send 同参 ⇒ 同 member。
 	c := *task
-	c.CreateTime = task.EndTime
+	if c.MaxRetry == 0 {
+		c.MaxRetry = b.retryCount
+	}
+	c.CreateTime = c.EndTime
 	data, err := json.Marshal(&c)
 	if err != nil {
 		return fmt.Errorf("timertask: marshal task: %w", err)
@@ -266,32 +267,53 @@ func (b *RedisBackend) requeuePendingOnShutdown() {
 			if c == nil || c.task == nil {
 				continue
 			}
-			task := c.task
-			data, err := json.Marshal(task)
-			if err != nil {
-				log.Error("requeue marshal failed", "taskID", task.ID, "err", err)
-				continue
+			if b.requeueClaim(ctx, c) {
+				requeued++
 			}
-			key := b.taskKey(task.ID)
-			pipe := b.client.Pipeline()
-			pipe.ZAdd(ctx, key, goredis.Z{
-				Score:  float64(task.EndTime),
-				Member: string(data),
-			})
-			if b.delivery == timertask.DeliveryAtLeastOnce {
-				pipe.ZRem(ctx, b.processingKey(), c.member)
-			}
-			if _, err := pipe.Exec(ctx); err != nil {
-				log.Error("requeue ZAdd failed", "taskID", task.ID, "err", err)
-				continue
-			}
-			requeued++
 		default:
 			if requeued > 0 {
 				log.Info("requeued pending tasks on shutdown", "count", requeued)
 			}
 			return
 		}
+	}
+}
+
+// requeueClaim 把一个已 claim、尚未处理的任务回灌 Redis（ZADD 回原分片，
+// 保留原 EndTime；at-least-once 时同时摘掉 processing 租约），返回是否成功。
+// 优雅停机的两条路径复用：localQueue 回灌（requeuePendingOnShutdown）与
+// claim 后未及入队的在途任务（consumeRemoteOnce 的停机窗口，#96）。
+func (b *RedisBackend) requeueClaim(ctx context.Context, c *claim) bool {
+	task := c.task
+	data, err := json.Marshal(task)
+	if err != nil {
+		log.Error("requeue marshal failed", "taskID", task.ID, "err", err)
+		return false
+	}
+	key := b.taskKey(task.ID)
+	pipe := b.client.Pipeline()
+	pipe.ZAdd(ctx, key, goredis.Z{
+		Score:  float64(task.EndTime),
+		Member: string(data),
+	})
+	if b.delivery == timertask.DeliveryAtLeastOnce {
+		pipe.ZRem(ctx, b.processingKey(), c.member)
+	}
+	if _, err := pipe.Exec(ctx); err != nil {
+		log.Error("requeue ZAdd failed", "taskID", task.ID, "err", err)
+		return false
+	}
+	return true
+}
+
+// requeueClaimOnShutdown 在停机窗口内回灌单个在途 claim（限时 5s，与
+// requeuePendingOnShutdown 的回灌窗口一致：Redis 黑洞时不把退出路径挂死，
+// 超窗按 at-most-once 语义放弃）。
+func (b *RedisBackend) requeueClaimOnShutdown(c *claim) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if b.requeueClaim(ctx, c) {
+		log.Info("requeued in-flight claim on shutdown", "taskID", c.task.ID)
 	}
 }
 
@@ -358,8 +380,15 @@ func (b *RedisBackend) consumeRemoteOnce(ctx context.Context) {
 				select {
 				case b.localQueue <- &claim{task: task, member: data}:
 				case <-ctx.Done():
+					// #96：claim（deleteScript 已原子删除/移入租约集）与入队之间
+					// 遇停机，直接 return 会把任务丢在「既不在 ZSet 也不在
+					// localQueue」的地方——requeuePendingOnShutdown 只回灌
+					// localQueue 里的任务，捡不到在途的这一份。先回灌 Redis
+					// 再退出。
+					b.requeueClaimOnShutdown(&claim{task: task, member: data})
 					return
 				case <-b.stopChan:
+					b.requeueClaimOnShutdown(&claim{task: task, member: data})
 					return
 				}
 			}
@@ -414,6 +443,21 @@ func (b *RedisBackend) processTask(ctx context.Context, c *claim) {
 			})
 		}
 	}()
+	// at-least-once：handler 执行期间周期续租（#93/#95）。defers LIFO——
+	// 本 defer 先于上面的 Ack defer 执行：续租先停干净，Ack 不会与续租竞争
+	// （ZAddArgs XX 也兜住了跨进程的迟到续租不复活已 Ack 的租约）。
+	if b.delivery == timertask.DeliveryAtLeastOnce {
+		stopRenew := make(chan struct{})
+		renewExited := make(chan struct{})
+		async.GoSafe(func() {
+			defer close(renewExited)
+			b.renewLoop(ctx, c.member, stopRenew)
+		})
+		defer func() {
+			close(stopRenew)
+			<-renewExited
+		}()
+	}
 	// retryTimer lazy init: i=0 直接调 handler，不需要 timer；只有真正进入重试路径
 	// 才创建 timer，避免每次成功任务都起一个未消费的 timer（defer Stop 不会释放
 	// 已经被 runtime 调度过但未读取的 tick，长时间运行会累积）。

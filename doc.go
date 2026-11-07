@@ -44,11 +44,12 @@
 //   - DeliveryAtLeastOnce（可靠模式）：claim 时把条目移入 processing 租约集
 //     （score=租约到期），handler 成功后 Ack 删除；租约超时由回扫按 RetryCount
 //     重投。kill -9 后未 Ack 任务会在 visibility timeout 后被重投（可容忍重复，
-//     由调用方幂等）。
+//     由调用方幂等）。handler 执行期间后台周期续租：慢于 visibilityTimeout 但
+//     最终成功的 handler 不会被回扫误判死亡而必现重复投递。
 //
 // 兜底路径：
 //   - 优雅停机（ctx 取消）时，本地队列中尚未处理的任务会回灌 Redis，
-//     重启后继续消费；
+//     重启后继续消费；claim 与入队之间停机窗口内的在途任务同样回灌；
 //   - 重试耗尽的任务会写入持久死信 ZSet（{timertask.<buzType>}.dead，
 //     score 为失败时间戳，默认保留最近 10000 条）；WithOnFailure 回调
 //     只是死信之外的进程内通知手段，不构成持久化。

@@ -431,3 +431,56 @@ func TestFakeClock(t *testing.T) {
 		t.Error("d <= 0 应立即就绪")
 	}
 }
+
+// TestScheduler_Start_ReturnsNilOnStop 钉住 #99：Stop 触发的正常停机，
+// Start 必须返回 nil——此前任何路径都返回非 nil（Stop 路径硬编码
+// context.Canceled），按惯用 `if err := sched.Start(ctx); err != nil` 写的
+// 调用方会把正常停机当失败处理。
+func TestScheduler_Start_ReturnsNilOnStop(t *testing.T) {
+	s, _ := newTestScheduler(t, Config{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- s.Start(ctx) }()
+	if !waitFor(t, 2*time.Second, func() bool { return s.isStarted() }) {
+		t.Fatal("Start 未生效")
+	}
+	if err := s.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Errorf("Stop 触发的正常停机应返回 nil，实得 %v（#99）", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop 后 Start 未返回")
+	}
+}
+
+// TestScheduler_Start_ReturnsCtxErrOnCancel 钉住 #99 的另一半：ctx 取消时
+// Start 返回 ctx.Err()（该语义保持不变，防回归）。
+func TestScheduler_Start_ReturnsCtxErrOnCancel(t *testing.T) {
+	s, _ := newTestScheduler(t, Config{})
+	ctx, cancel := context.WithCancel(context.Background())
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- s.Start(ctx) }()
+	if !waitFor(t, 2*time.Second, func() bool { return s.isStarted() }) {
+		t.Fatal("Start 未生效")
+	}
+	cancel()
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("ctx 取消应返回 context.Canceled，实得 %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancel 后 Start 未返回")
+	}
+	// 清理：调度器已因 ctx 取消停止，Stop 幂等收尾
+	if err := s.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+}
