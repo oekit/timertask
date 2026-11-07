@@ -132,3 +132,71 @@ func TestAtMostOnce_DefaultUnchanged(t *testing.T) {
 		t.Fatalf("local=%d, want 1", b.LocalPendingCount())
 	}
 }
+
+// leaseScore 轮询 processing 集中唯一 member 的 score，超过 min 即返回
+// （min=0 表示等首次出现；min>0 表示等续租把它推高）。
+func leaseScore(t *testing.T, b *RedisBackend, min float64) float64 {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		members, err := b.client.ZRangeWithScores(context.Background(), b.processingKey(), 0, -1).Result()
+		if err == nil && len(members) == 1 && members[0].Score > min {
+			return members[0].Score
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("processing 租约 score 未在 3s 内超过 %v", min)
+	return 0
+}
+
+// TestAtLeastOnce_LeaseRenewedDuringSlowHandler 钉住 #93/#95：handler 执行
+// 期间必须有租约续期——跑得比 visibilityTimeout 慢的 handler 不被回扫误判
+// 死亡而重投。此前 claim 后租约永不续期，慢 handler 到点必被重投、至少执行
+// 两次（必现重复，非偶发），首次成功后的 Ack 拦不住已重投的副本。
+func TestAtLeastOnce_LeaseRenewedDuringSlowHandler(t *testing.T) {
+	vis := 600 * time.Millisecond // 租约实际按 1s 计（亚秒配置的补偿规则）
+	release := make(chan struct{})
+	var calls atomic.Int32
+	b := newReliableBackend(t, vis, func(ctx context.Context, task *timertask.Task) error {
+		calls.Add(1)
+		<-release // 模拟慢 handler：阻塞到测试放行
+		return nil
+	})
+	task := &timertask.Task{ID: "slow-1", EndTime: time.Now().Unix() - 1, MaxRetry: 5}
+	if err := b.Send(context.Background(), task); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	go func() { _ = b.Start(ctx) }()
+
+	// 等任务被 claim 进 processing，记下初始租约 deadline
+	initial := leaseScore(t, b, 0)
+	// 等续租发生（deadline 被推高——证明 renewal 在跑）
+	leaseScore(t, b, initial)
+	// 走过初始 deadline：此刻若无续期，租约已过期
+	if wait := time.Until(time.Unix(int64(initial), 0).Add(200 * time.Millisecond)); wait > 0 {
+		time.Sleep(wait)
+	}
+
+	// handler 仍在执行（未 Ack）：回扫不得把它重投（旧实现此处必重投）
+	b.reapExpiredLeases(context.Background())
+	if pending, _ := b.PendingCount(context.Background()); pending != 0 {
+		t.Fatalf("慢 handler 执行中租约被回扫重投（#93/#95），pending = %d", pending)
+	}
+
+	close(release) // 放行 handler → 成功 → Ack
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		n, _ := b.client.ZCard(context.Background(), b.processingKey()).Result()
+		if n == 0 {
+			if got := calls.Load(); got != 1 {
+				t.Fatalf("handler 执行 %d 次，want 1（无重复投递）", got)
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("handler 成功后租约未被 Ack（processing 仍有条目）")
+}

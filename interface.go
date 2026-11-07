@@ -201,6 +201,8 @@ func WithDeliveryMode(m DeliveryMode) TimerTaskOption {
 // WithAtLeastOnce 开启可靠投递（等价 WithDeliveryMode(DeliveryAtLeastOnce)），
 // visibilityTimeout 为 processing 租约时长（<=0 取默认 60s）。
 // claim 后任务进入租约集，成功 Ack 删除；超时未 Ack 由回扫按 RetryCount 重投。
+// handler 执行期间后台按 visibilityTimeout/3 周期续租——慢于 visibilityTimeout
+// 的 handler 不会被回扫误判死亡而重复投递，无需把 handler 限制在租约时长内。
 func WithAtLeastOnce(visibilityTimeout time.Duration) TimerTaskOption {
 	return func(c *config) {
 		c.delivery = DeliveryAtLeastOnce

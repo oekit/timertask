@@ -443,6 +443,21 @@ func (b *RedisBackend) processTask(ctx context.Context, c *claim) {
 			})
 		}
 	}()
+	// at-least-once：handler 执行期间周期续租（#93/#95）。defers LIFO——
+	// 本 defer 先于上面的 Ack defer 执行：续租先停干净，Ack 不会与续租竞争
+	// （ZAddArgs XX 也兜住了跨进程的迟到续租不复活已 Ack 的租约）。
+	if b.delivery == timertask.DeliveryAtLeastOnce {
+		stopRenew := make(chan struct{})
+		renewExited := make(chan struct{})
+		async.GoSafe(func() {
+			defer close(renewExited)
+			b.renewLoop(ctx, c.member, stopRenew)
+		})
+		defer func() {
+			close(stopRenew)
+			<-renewExited
+		}()
+	}
 	// retryTimer lazy init: i=0 直接调 handler，不需要 timer；只有真正进入重试路径
 	// 才创建 timer，避免每次成功任务都起一个未消费的 timer（defer Stop 不会释放
 	// 已经被 runtime 调度过但未读取的 tick，长时间运行会累积）。
