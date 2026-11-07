@@ -2,6 +2,10 @@
 
 由 ekit v0.34.0（git.enjoye.top/enjoydream/ekit，冻结维护）拆分而来。所有 notable 变更记录如下。
 
+## [redis/v0.2.15] — 2026-11-07
+
+- build: 父模块地板对齐（嵌套 go.mod 的父仓 require 跟随最新，audit 门禁项）
+
 ## [redis/v0.2.14] — 2026-11-07
 
 - fix(local): scanOnce 锁内只弹出到期任务、发送移到锁外——满队列+慢 handler 不再整体卡死 Send/PendingCount（#92 #94）
