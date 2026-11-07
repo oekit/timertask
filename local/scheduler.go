@@ -206,6 +206,11 @@ func (s *Scheduler) Unschedule(spec string) bool {
 //
 // 返回时调度器已停止：不再产生新触发；正在执行的任务不会被强制中断
 // （任务可通过 ctx 感知取消并自行退出）。重复调用返回错误。
+//
+// 返回值（#99）：Stop 触发的正常停机返回 nil——此前任何路径都返回非 nil
+// （Stop 路径硬编码 context.Canceled），按惯用
+// `if err := sched.Start(ctx); err != nil { log.Fatal }` 写的调用方会把
+// 正常停机当失败处理。仅 ctx 取消时返回 ctx.Err()。
 func (s *Scheduler) Start(ctx context.Context) error {
 	s.mu.Lock()
 	if s.started {
@@ -237,10 +242,8 @@ func (s *Scheduler) Start(ctx context.Context) error {
 	case <-s.stopCh:
 	}
 	s.shutdown()
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	return context.Canceled
+	// #99：Stop 触发的正常停机（ctx 未取消）返回 nil；ctx 取消返回 ctx.Err()。
+	return ctx.Err()
 }
 
 // Stop 停止调度并等待正在执行的任务结束。
