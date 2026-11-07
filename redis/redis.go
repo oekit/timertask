@@ -267,32 +267,53 @@ func (b *RedisBackend) requeuePendingOnShutdown() {
 			if c == nil || c.task == nil {
 				continue
 			}
-			task := c.task
-			data, err := json.Marshal(task)
-			if err != nil {
-				log.Error("requeue marshal failed", "taskID", task.ID, "err", err)
-				continue
+			if b.requeueClaim(ctx, c) {
+				requeued++
 			}
-			key := b.taskKey(task.ID)
-			pipe := b.client.Pipeline()
-			pipe.ZAdd(ctx, key, goredis.Z{
-				Score:  float64(task.EndTime),
-				Member: string(data),
-			})
-			if b.delivery == timertask.DeliveryAtLeastOnce {
-				pipe.ZRem(ctx, b.processingKey(), c.member)
-			}
-			if _, err := pipe.Exec(ctx); err != nil {
-				log.Error("requeue ZAdd failed", "taskID", task.ID, "err", err)
-				continue
-			}
-			requeued++
 		default:
 			if requeued > 0 {
 				log.Info("requeued pending tasks on shutdown", "count", requeued)
 			}
 			return
 		}
+	}
+}
+
+// requeueClaim 把一个已 claim、尚未处理的任务回灌 Redis（ZADD 回原分片，
+// 保留原 EndTime；at-least-once 时同时摘掉 processing 租约），返回是否成功。
+// 优雅停机的两条路径复用：localQueue 回灌（requeuePendingOnShutdown）与
+// claim 后未及入队的在途任务（consumeRemoteOnce 的停机窗口，#96）。
+func (b *RedisBackend) requeueClaim(ctx context.Context, c *claim) bool {
+	task := c.task
+	data, err := json.Marshal(task)
+	if err != nil {
+		log.Error("requeue marshal failed", "taskID", task.ID, "err", err)
+		return false
+	}
+	key := b.taskKey(task.ID)
+	pipe := b.client.Pipeline()
+	pipe.ZAdd(ctx, key, goredis.Z{
+		Score:  float64(task.EndTime),
+		Member: string(data),
+	})
+	if b.delivery == timertask.DeliveryAtLeastOnce {
+		pipe.ZRem(ctx, b.processingKey(), c.member)
+	}
+	if _, err := pipe.Exec(ctx); err != nil {
+		log.Error("requeue ZAdd failed", "taskID", task.ID, "err", err)
+		return false
+	}
+	return true
+}
+
+// requeueClaimOnShutdown 在停机窗口内回灌单个在途 claim（限时 5s，与
+// requeuePendingOnShutdown 的回灌窗口一致：Redis 黑洞时不把退出路径挂死，
+// 超窗按 at-most-once 语义放弃）。
+func (b *RedisBackend) requeueClaimOnShutdown(c *claim) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if b.requeueClaim(ctx, c) {
+		log.Info("requeued in-flight claim on shutdown", "taskID", c.task.ID)
 	}
 }
 
@@ -359,8 +380,15 @@ func (b *RedisBackend) consumeRemoteOnce(ctx context.Context) {
 				select {
 				case b.localQueue <- &claim{task: task, member: data}:
 				case <-ctx.Done():
+					// #96：claim（deleteScript 已原子删除/移入租约集）与入队之间
+					// 遇停机，直接 return 会把任务丢在「既不在 ZSet 也不在
+					// localQueue」的地方——requeuePendingOnShutdown 只回灌
+					// localQueue 里的任务，捡不到在途的这一份。先回灌 Redis
+					// 再退出。
+					b.requeueClaimOnShutdown(&claim{task: task, member: data})
 					return
 				case <-b.stopChan:
+					b.requeueClaimOnShutdown(&claim{task: task, member: data})
 					return
 				}
 			}
