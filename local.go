@@ -60,6 +60,10 @@ type LocalBackend struct {
 	mu      sync.Mutex
 	queue   priorityQueue
 	taskMap map[string]*localTaskItem
+	// inflight 记录「已弹出优先队列、尚在执行窗口内」的任务 ID（#98）：
+	// 同 ID 去重不再只覆盖排队态——scanOnce 弹出时占用、processTask
+	// 返回时释放，执行窗口内重复 Send 一样不入队。
+	inflight map[string]struct{}
 
 	// 本地队列
 	localQueue chan *Task
@@ -85,6 +89,7 @@ func NewLocalBackend(handler Handler, opts ...TimerTaskOption) *LocalBackend {
 		clock:      clock,
 		queue:      make(priorityQueue, 0),
 		taskMap:    make(map[string]*localTaskItem),
+		inflight:   make(map[string]struct{}),
 		localQueue: make(chan *Task, 10000),
 		stopChan:   make(chan struct{}),
 	}
@@ -100,31 +105,43 @@ func NewLocalBackend(handler Handler, opts ...TimerTaskOption) *LocalBackend {
 // 语义：
 //   - task.ID 为空 ⇒ 返回 ErrEmptyTaskID（ID 必须唯一，空 ID 无法区分任务）。
 //   - 同 ID 重复提交 ⇒ **不入队**（先到先得），返回 nil（视为幂等提交成功）。
-//     此前既不报错也不记日志，调用方无法判断本次是否真的入队；现在补一条
-//     日志，让「这次没入队」在日志里可见。
+//     占用窗口覆盖排队态**与执行窗口**（#98）：任务被扫描弹出进入执行后、
+//     处理结束前，同 ID Send 同样不入队——调用方依赖该幂等语义防重不会在
+//     执行窗口内失效。处理结束后 ID 释放，可重新提交。
+//   - 不改写调用方的 Task（#97）：CreateTime/MaxRetry 的缺省补齐、worker
+//     重试时对 RetryCount 的推进都落在引擎内部的副本上，调用方提交后继续
+//     读/复用自己的 Task 结构不会看到字段被引擎改写。
 func (b *LocalBackend) Send(ctx context.Context, task *Task) error {
 	if task.ID == "" {
 		return ErrEmptyTaskID
 	}
-	if task.CreateTime == 0 {
-		task.CreateTime = b.now().Unix()
+	// #97：入队前深拷贝（Task 全为值字段，浅拷贝即全量拷贝）——缺省补齐与
+	// worker 侧改写都落在副本上，调用方对象保持提交时的原样。
+	c := *task
+	if c.CreateTime == 0 {
+		c.CreateTime = b.now().Unix()
 	}
-	if task.MaxRetry == 0 {
-		task.MaxRetry = b.retryCount
+	if c.MaxRetry == 0 {
+		c.MaxRetry = b.retryCount
 	}
 
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	// 检查任务是否已存在
+	// 检查任务是否已存在（排队态）
 	if _, exists := b.taskMap[task.ID]; exists {
 		logger.Info("task already scheduled, skipped", "taskID", task.ID)
 		return nil
 	}
+	// 检查任务是否在执行窗口内（#98）
+	if _, busy := b.inflight[task.ID]; busy {
+		logger.Info("task already in flight, skipped", "taskID", task.ID)
+		return nil
+	}
 
 	item := &localTaskItem{
-		task:     task,
-		execTime: task.EndTime,
+		task:     &c,
+		execTime: c.EndTime,
 	}
 
 	heap.Push(&b.queue, item)
@@ -176,28 +193,49 @@ func (b *LocalBackend) now() time.Time { return b.clock.Now() }
 func (b *LocalBackend) scanOnce(ctx context.Context) {
 	now := b.now().Unix()
 
+	// #92/#94：锁内只 pop 到期任务，推入 localQueue 的发送在**锁外**做。
+	// 此前发送在 b.mu 保护内：localQueue（容量 10000）涨满且 worker 全卡在
+	// 慢 handler 时，select 阻塞在发送上但仍持锁 ⇒ Send/PendingCount 全部
+	// 堵在 b.mu 上——互斥量被无限期占住，加锁互斥量整体卡死。
 	b.mu.Lock()
-	defer b.mu.Unlock()
-
+	var due []*localTaskItem
 	for b.queue.Len() > 0 {
 		item := b.queue[0]
 		if item.execTime > now {
 			break
 		}
-
-		// 弹出到期任务
 		heap.Pop(&b.queue)
 		delete(b.taskMap, item.task.ID)
+		// #98：与 delete(taskMap) 同一临界段内占用 inflight——弹出与占用
+		// 之间没有窗口，执行窗口内的同 ID Send 必然被去重挡住。
+		b.inflight[item.task.ID] = struct{}{}
+		due = append(due, item)
+	}
+	b.mu.Unlock()
 
-		// 推入本地队列
+	for i, item := range due {
 		select {
 		case b.localQueue <- item.task:
 		case <-ctx.Done():
+			// 未送达的剩余任务释放 ID 占用（at-most-once：停机窗口内丢弃，
+			// 与 Start 的停机语义一致）
+			b.releaseInflight(due[i:])
 			return
 		case <-b.stopChan:
+			b.releaseInflight(due[i:])
 			return
 		}
 	}
+}
+
+// releaseInflight 释放 in-flight ID 占用（#98）：items 为尚未送达 localQueue
+// 的剩余弹出任务。
+func (b *LocalBackend) releaseInflight(items []*localTaskItem) {
+	b.mu.Lock()
+	for _, item := range items {
+		delete(b.inflight, item.task.ID)
+	}
+	b.mu.Unlock()
 }
 
 // workerLoop 从本地队列消费任务。
@@ -219,6 +257,14 @@ func (b *LocalBackend) workerLoop(ctx context.Context) {
 
 // processTask 处理单个任务，支持重试。
 func (b *LocalBackend) processTask(ctx context.Context, task *Task) {
+	// #98：处理结束（成功 / 重试耗尽 / 中断返回）释放 ID 占用——此后同 ID
+	// 可重新提交。被中断的任务按 at-most-once 语义丢弃，释放后调用方可重发。
+	defer func() {
+		b.mu.Lock()
+		delete(b.inflight, task.ID)
+		b.mu.Unlock()
+	}()
+
 	var err error
 	normalizeRetry(task)
 	// retryTimer lazy init：见 redis.go 对应注释。
