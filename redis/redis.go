@@ -36,6 +36,20 @@ const (
 // 用 var 而非 const：测试需要把它调小以在毫秒级内复现「黑洞」场景。
 var bestEffortTimeout = 5 * time.Second
 
+// requeueShutdownWindow 是三条停机回灌路径（requeuePendingOnShutdown /
+// requeueClaimOnShutdown / requeueLeasesOnShutdown）共享的回灌窗口。
+//
+// 超窗后按 doc 声明的 at-most-once 语义放弃：未回灌的任务/租约交给 Redis
+// 侧的回扫（reapExpiredLeases / 下个周期）兜底。
+//
+// ⚠️ 窗口必须是**真实墙钟约束**（#121）：go-redis 默认丢弃调用方的 ctx
+// deadline（Options.ContextTimeoutEnabled 默认 false），裸
+// context.WithTimeout 对它是虚构的——所以三条路径的回灌调用都套
+// bestEffortRedisTimeout（select + 弃子 goroutine）实现真实限时。
+//
+// 用 var 而非 const：测试需要把它调小以在毫秒级内复现「黑洞」场景。
+var requeueShutdownWindow = 5 * time.Second
+
 // deleteScript Lua 原子删除脚本（原子 claim 消费到的 task）。
 //
 // 条件: task 实际 score (EndTime) <= ARGV[2] (current scan time) 时删除。
@@ -85,6 +99,13 @@ type RedisBackend struct {
 	localQueue chan *claim
 	stopChan   chan struct{}
 	stopOnce   sync.Once
+	// started/stopped 是 Start 的状态机（#124），语义与 LocalBackend 一致，
+	// 由 mu 保护：stopChan 关闭后不重建，不做状态机的话二次 Start 会拉起一组
+	// 立刻哑火的消费者（本实例消费吞吐静默归零），Start 却阻塞在新 ctx 上
+	// 看起来健康。状态机让「第二次 Start」要么报错、要么（首次）真的开始消费。
+	mu      sync.Mutex
+	started bool
+	stopped bool
 }
 
 // claim 是本地队列中的已 claim 任务，member 为 ZSet 原始成员串。
@@ -135,9 +156,19 @@ func NewRedisBackend(buzType string, client goredis.UniversalClient, handler tim
 // #97：不改写调用方的 Task——CreateTime/MaxRetry 的缺省补齐与 member 规范化
 // 都落在内部副本上（Task 全为值字段，浅拷贝即全量拷贝），调用方提交后继续
 // 读/复用自己的 Task 结构不会看到字段被引擎改写。
+//
+// 后端停机后（Start 已返回）返回 timertask.ErrBackendStopped（#124）：实例
+// 的消费循环已经退出，继续投递只会制造「写入成功、本实例零消费」的错觉；
+// 要继续投递请重建实例或换用存活实例。
 func (b *RedisBackend) Send(ctx context.Context, task *timertask.Task) error {
 	if task.ID == "" {
 		return timertask.ErrEmptyTaskID
+	}
+	b.mu.Lock()
+	stopped := b.stopped
+	b.mu.Unlock()
+	if stopped {
+		return timertask.ErrBackendStopped
 	}
 	// 规范化 member：拷贝后补 MaxRetry 缺省、钉 CreateTime=EndTime
 	// （CreateTime 的补 now 随 #75 的钉死早已到不了 member，随 #97 一并移除）；
@@ -211,7 +242,27 @@ func (b *RedisBackend) Remove(ctx context.Context, taskID string, endTS int64) (
 
 // Start 启动任务消费（阻塞）。
 // ctx 取消时所有 goroutine 退出。
+//
+// 实例一次性（#124）：Start 返回后实例进入停机态——再次调用返回
+// timertask.ErrBackendStopped（首个 Start 尚未返回时的并发重复调用返回
+// already started 错误），不会像旧实现那样拉起一组因 stopChan 已关闭而
+// 立刻退出的哑火 goroutine。需要重启任务消费请重建实例。
 func (b *RedisBackend) Start(ctx context.Context) error {
+	// #124 状态机：入口先做状态检查并登记 started。检查必须在拉起 goroutine
+	// 之前，否则二次调用同样会拉起一组必然哑火的消费者。
+	b.mu.Lock()
+	if b.stopped {
+		b.mu.Unlock()
+		return timertask.ErrBackendStopped
+	}
+	if b.started {
+		b.mu.Unlock()
+		// 与根包 errBackendAlreadyStarted 同串（独立 module 无法访问未导出符号）。
+		return errors.New("timertask: backend already started")
+	}
+	b.started = true
+	b.mu.Unlock()
+
 	// 启动心跳
 	async.GoSafe(func() { b.shardManager.StartHeartbeat(ctx) })
 
@@ -242,32 +293,49 @@ func (b *RedisBackend) Start(ctx context.Context) error {
 	if b.delivery == timertask.DeliveryAtLeastOnce {
 		b.requeueLeasesOnShutdown()
 	}
+	// #124：停机收尾完成后登记 stopped——此后的二次 Start / Send 都显式报错
+	// （timertask.ErrBackendStopped）。
+	b.mu.Lock()
+	b.stopped = true
+	b.mu.Unlock()
 	return ctx.Err()
 }
 
 // requeuePendingOnShutdown 将本地队列中尚未处理的任务回灌 Redis（ZADD 回原分片，
 // 保留原 EndTime），重启后由任意实例继续消费。仅覆盖优雅停机路径；
 // 进程崩溃时队列内任务仍会丢失（见包文档的 at-most-once 语义）。
+//
+// 回灌窗口限时 requeueShutdownWindow：Redis 黑洞（网络分区而非拒连）时无界
+// 的 ZAdd 会挂到 OS 级 TCP 超时（分钟级），worker 无法退出、Start 调用方
+// 卡死。窗口是真实墙钟约束（#121）：每笔回灌套 bestEffortRedisTimeout
+// （go-redis 默认丢弃调用方 ctx deadline，裸 WithTimeout 对黑洞客户端是
+// 虚构的），预算取剩余窗口并逐次收紧——总耗时必然 ≤ 窗口。超窗后剩余任务
+// 按 doc 声明的 at-most-once 语义丢弃。
 func (b *RedisBackend) requeuePendingOnShutdown() {
 	requeued := 0
-	// 回灌窗口限时：Redis 黑洞（网络分区而非拒连）时无 deadline 的 ZAdd 会
-	// 挂到 OS 级 TCP 超时（分钟级），worker 无法退出、Start 调用方卡死。
-	// 超时后剩余任务按 doc 声明的 at-most-once 语义丢弃。
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+	deadline := time.Now().Add(requeueShutdownWindow)
 	for {
-		select {
-		case <-ctx.Done():
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
 			if requeued > 0 {
 				log.Warn("requeue window expired, remaining tasks dropped (at-most-once)",
 					"requeued", requeued)
 			}
 			return
+		}
+		select {
 		case c := <-b.localQueue:
 			if c == nil || c.task == nil {
 				continue
 			}
-			if b.requeueClaim(ctx, c) {
+			okCh := make(chan bool, 1)
+			err := bestEffortRedisTimeout("requeue_pending_shutdown", remaining, func(callCtx context.Context) error {
+				okCh <- b.requeueClaim(callCtx, c)
+				return nil
+			})
+			// err == nil ⇔ 回灌调用在窗口内真实完成（闭包恒返回 nil）；
+			// 超窗弃子时闭包可能仍在途，不能读 okCh（否则与迟到的写入竞态）。
+			if err == nil && <-okCh {
 				requeued++
 			}
 		default:
@@ -306,15 +374,21 @@ func (b *RedisBackend) requeueClaim(ctx context.Context, c *claim) bool {
 	return true
 }
 
-// requeueClaimOnShutdown 在停机窗口内回灌单个在途 claim（限时 5s，与
-// requeuePendingOnShutdown 的回灌窗口一致：Redis 黑洞时不把退出路径挂死，
-// 超窗按 at-most-once 语义放弃）。
+// requeueClaimOnShutdown 在停机窗口内回灌单个在途 claim（限时
+// requeueShutdownWindow，与 requeuePendingOnShutdown 的回灌窗口一致：Redis
+// 黑洞时不把退出路径挂死，超窗按 at-most-once 语义放弃）。
+//
+// #121：限时是真实墙钟约束——go-redis 默认丢弃调用方 ctx deadline
+// （ContextTimeoutEnabled=false），裸 WithTimeout 对黑洞客户端是虚构的
+// （实测 deadline ctx 下仍阻塞整段 ReadTimeout），所以套 bestEffortRedisTimeout
+// （select + 弃子 goroutine）实现。
 func (b *RedisBackend) requeueClaimOnShutdown(c *claim) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if b.requeueClaim(ctx, c) {
-		log.Info("requeued in-flight claim on shutdown", "taskID", c.task.ID)
-	}
+	_ = bestEffortRedisTimeout("requeue_claim_shutdown", requeueShutdownWindow, func(ctx context.Context) error {
+		if b.requeueClaim(ctx, c) {
+			log.Info("requeued in-flight claim on shutdown", "taskID", c.task.ID)
+		}
+		return nil
+	})
 }
 
 // consumeRemoteLoop 定期扫描到期任务并推入本地队列。
@@ -446,6 +520,9 @@ func (b *RedisBackend) processTask(ctx context.Context, c *claim) {
 	// at-least-once：handler 执行期间周期续租（#93/#95）。defers LIFO——
 	// 本 defer 先于上面的 Ack defer 执行：续租先停干净，Ack 不会与续租竞争
 	// （ZAddArgs XX 也兜住了跨进程的迟到续租不复活已 Ack 的租约）。
+	// join 有界（#122）：renewLoop 内的续租调用自带弃子限时
+	// （min(2s, interval)，见 renewLoop），收尾 join 至多等一个限时窗口，
+	// 不会被黑洞里的续租写卡到客户端 ReadTimeout。
 	if b.delivery == timertask.DeliveryAtLeastOnce {
 		stopRenew := make(chan struct{})
 		renewExited := make(chan struct{})
@@ -533,6 +610,13 @@ func (b *RedisBackend) sendToDeadLetter(task *timertask.Task) {
 }
 
 // bestEffortRedis 跑一个「尽力而为」的 Redis 写，最多等 bestEffortTimeout。
+func bestEffortRedis(op string, fn func(ctx context.Context) error) {
+	_ = bestEffortRedisTimeout(op, bestEffortTimeout, fn)
+}
+
+// bestEffortRedisTimeout 跑一个「尽力而为」的 Redis 调用，最多等 timeout
+// （#121 起收尾路径统一走这里：三条停机回灌路径与续租调用都需要自定义窗口，
+// 不再只有全局 bestEffortTimeout 一档）。
 //
 // **为什么不能只靠 ctx deadline**：go-redis 默认**丢弃**调用方的 ctx deadline
 // （Options.ContextTimeoutEnabled 默认为 false ⇒ baseClient.context 返回
@@ -543,22 +627,29 @@ func (b *RedisBackend) sendToDeadLetter(task *timertask.Task) {
 // 这里显式限时：超时即放弃（best-effort 语义：失败只记日志），worker 立刻
 // 回到池里；被放弃的 goroutine 会在客户端自身的 ReadTimeout 到点后自行结束
 // （连接随之归还连接池，不会泄漏）。
-func bestEffortRedis(op string, fn func(ctx context.Context) error) {
-	ctx, cancel := context.WithTimeout(context.Background(), bestEffortTimeout)
+//
+// 返回 fn 的错误；超时放弃时返回 context.DeadlineExceeded。放弃后调用方
+// 不得再读取 fn 闭包捕获的结果（fn 可能仍在途、与迟到的写入竞态）。
+func bestEffortRedisTimeout(op string, timeout time.Duration, fn func(ctx context.Context) error) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	done := make(chan struct{})
+	var fnErr error
 	async.GoSafe(func() {
 		defer close(done)
-		if err := fn(ctx); err != nil {
-			log.Error("best-effort redis write failed", "op", op, "err", err)
+		fnErr = fn(ctx)
+		if fnErr != nil {
+			log.Error("best-effort redis write failed", "op", op, "err", fnErr)
 		}
 	})
 
 	select {
 	case <-done:
+		return fnErr
 	case <-ctx.Done():
-		log.Warn("best-effort redis write timed out, abandoned", "op", op, "timeout", bestEffortTimeout)
+		log.Warn("best-effort redis write timed out, abandoned", "op", op, "timeout", timeout)
+		return ctx.Err()
 	}
 }
 
