@@ -69,6 +69,13 @@ type LocalBackend struct {
 	localQueue chan *Task
 	stopChan   chan struct{}
 	stopOnce   sync.Once
+	// started/stopped 是 Start 的状态机（#124）：started 在 Start 入口登记，
+	// stopped 在停机收尾登记，由 b.mu 保护。stopChan 关闭后没有任何路径重建
+	// 它——若不做状态机，二次 Start 拉起的 goroutine 会全部立刻命中已关闭的
+	// stopChan 退出（哑火），任务照常入堆但零消费，是比 panic 更隐蔽的静默
+	// 失效。状态机让「第二次 Start」要么报错、要么（首次）真的开始消费。
+	started bool
+	stopped bool
 }
 
 // NewLocalBackend 创建基于内存的本地延迟任务后端。
@@ -111,6 +118,9 @@ func NewLocalBackend(handler Handler, opts ...TimerTaskOption) *LocalBackend {
 //   - 不改写调用方的 Task（#97）：CreateTime/MaxRetry 的缺省补齐、worker
 //     重试时对 RetryCount 的推进都落在引擎内部的副本上，调用方提交后继续
 //     读/复用自己的 Task 结构不会看到字段被引擎改写。
+//   - 后端停机后（Start 已返回）⇒ 返回 ErrBackendStopped（#124），任务
+//     不入堆——继续入堆会让 PendingCount 持续增长而永无消费，运维会误判
+//     为队列积压。
 func (b *LocalBackend) Send(ctx context.Context, task *Task) error {
 	if task.ID == "" {
 		return ErrEmptyTaskID
@@ -127,6 +137,11 @@ func (b *LocalBackend) Send(ctx context.Context, task *Task) error {
 
 	b.mu.Lock()
 	defer b.mu.Unlock()
+
+	// #124：停机后拒绝新任务（见 Send 注释的任务不入堆条目）。
+	if b.stopped {
+		return ErrBackendStopped
+	}
 
 	// 检查任务是否已存在（排队态）
 	if _, exists := b.taskMap[task.ID]; exists {
@@ -153,7 +168,27 @@ func (b *LocalBackend) Send(ctx context.Context, task *Task) error {
 
 // Start 启动任务消费（阻塞）。
 // ctx 取消时所有 goroutine 退出。
+//
+// 实例一次性（#124）：Start 返回后实例进入停机态——再次调用返回
+// ErrBackendStopped（首个 Start 尚未返回时的并发重复调用返回 already
+// started 错误），不会像旧实现那样拉起一组因 stopChan 已关闭而立刻退出的
+// 哑火 goroutine。需要重启任务消费请重建实例。
 func (b *LocalBackend) Start(ctx context.Context) error {
+	// #124 状态机：入口先做状态检查并登记 started（与 Send/PendingCount 共用
+	// b.mu）。检查必须在拉起 goroutine 之前，否则二次调用同样会拉起一组必然
+	// 哑火的消费者。
+	b.mu.Lock()
+	if b.stopped {
+		b.mu.Unlock()
+		return ErrBackendStopped
+	}
+	if b.started {
+		b.mu.Unlock()
+		return errBackendAlreadyStarted
+	}
+	b.started = true
+	b.mu.Unlock()
+
 	// 启动扫描器
 	goSafe(func() { b.scanLoop(ctx) })
 
@@ -167,6 +202,10 @@ func (b *LocalBackend) Start(ctx context.Context) error {
 	// Local 侧任务为 at-most-once:localQueue 阻塞中遇停机的任务直接丢弃、
 	// 无回灌(与 Redis 侧 doc 声明的语义对齐,进程存活期内不丢已执行任务)
 	b.stopOnce.Do(func() { close(b.stopChan) })
+	// #124：登记停机——此后的二次 Start / Send 都显式报错（ErrBackendStopped）。
+	b.mu.Lock()
+	b.stopped = true
+	b.mu.Unlock()
 	return ctx.Err()
 }
 

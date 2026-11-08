@@ -54,6 +54,25 @@ type Task struct {
 // 构造期直接报错，把「调用方漏填 ID」这类接线错误挡在提交那一刻。
 var ErrEmptyTaskID = errors.New("timertask: task ID must not be empty")
 
+// ErrBackendStopped 表示后端已停机（Start 已返回），实例进入终态。
+//
+// 实例一次性（#124）：Start 返回后实例的 stopChan 已永久关闭且不重建——
+// 此前二次 Start 会静默哑火（新拉起的消费 goroutine 立刻命中已关闭的
+// stopChan 退出，Start 却阻塞在新的 ctx 上看起来健康，Send 照常入队但
+// 零消费），这个「写入成功、无人消费、无任何信号」的形态比崩溃更难排查。
+// 现在停机后的二次 Start 与 Send 都返回本错误：要么真的开始消费，要么
+// 明确失败。需要重启任务消费请重建实例（NewLocalBackend /
+// redis.NewRedisBackend）。
+var ErrBackendStopped = errors.New("timertask: backend stopped")
+
+// errBackendAlreadyStarted 表示首个 Start 尚未返回时又调用了 Start（#124 的
+// 并发形态）：消费 goroutine 已在运行，重复调用直接报错，避免第二组消费者
+// 在第一段停机时集体哑火而调用方毫无感知。
+//
+// redis 嵌套模块（独立 module）无法访问本符号，自持一份同串实现——与
+// runHandlerSafe 的「同源独立一份」先例一致。
+var errBackendAlreadyStarted = errors.New("timertask: backend already started")
+
 // Handler 是任务处理函数。
 type Handler func(ctx context.Context, task *Task) error
 
@@ -84,10 +103,15 @@ func normalizeRetry(task *Task) {
 type TimerTask interface {
 	// Send 提交一个延迟任务。
 	// task.EndTime（Unix 秒）决定任务何时被执行。
+	// 后端停机后（Start 已返回）调用返回 ErrBackendStopped，任务不入队。
 	Send(ctx context.Context, task *Task) error
 
 	// Start 启动任务消费（阻塞）。
 	// ctx 取消时所有 goroutine 退出。
+	//
+	// 实例一次性（#124）：Start 返回后实例进入停机态，二次 Start 返回
+	// ErrBackendStopped（并发重复调用返回 already started 错误），不会
+	// 拉起一组永不消费的哑火 goroutine。需要重启请重建实例。
 	Start(ctx context.Context) error
 
 	// PendingCount 返回队列中待处理任务数。
