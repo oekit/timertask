@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/oekit/timertask"
@@ -79,6 +80,15 @@ func (b *RedisBackend) leaseDeadline(now int64) int64 {
 //
 // ZAddArgs 用 XX（仅更新已存在的 member）：租约已被 Ack（ZRem）或被回扫
 // 摘除后，迟到的续租不会把 member 复活成孤儿租约。
+//
+// 续租调用限时（#122）：本循环位于 worker 的**关键退出路径**上——processTask
+// 收尾要 join 本循环，裸 ZAddArgs 阻塞在黑洞（网络分区而非拒连）里时 join
+// 只能等客户端 ReadTimeout 解救：持续黑洞下每个任务收尾都被拖一截
+// ReadTimeout（吞吐塌方），优雅停机时所有 worker 的退出 defer 同时被卡。
+// 与 Ack/死信同一纪律：收尾路径上的 Redis 调用必须限时。限时取
+// min(2s, interval)——正常续租是单命令毫秒级返回；超窗放弃不破坏语义：
+// 租约交给回扫兜底（at-least-once 退化为旧行为，不会丢）。join 因此有界：
+// 至多等一个限时窗口。
 func (b *RedisBackend) renewLoop(ctx context.Context, member string, stop <-chan struct{}) {
 	// 续租周期取租约的 1/3（与回扫周期同比例）：任一跳的抖动都不会让
 	// deadline 落后于 now。
@@ -86,6 +96,17 @@ func (b *RedisBackend) renewLoop(ctx context.Context, member string, stop <-chan
 	if interval < 20*time.Millisecond {
 		interval = 20 * time.Millisecond
 	}
+	renewTimeout := interval
+	if renewTimeout > 2*time.Second {
+		renewTimeout = 2 * time.Second
+	}
+	// 单飞闸（#122）：限时是弃子实现——被放弃的调用还会卡在客户端里直到
+	// 客户端自身的 ReadTimeout。interval 远小于 ReadTimeout 的配置下，若不
+	// 设闸，每个 tick 都会再弃一个卡死的调用，堆积弃子 goroutine 与连接。
+	// 闸保证同一时刻至多一个在途续租调用：在途未归（卡死中）时后续 tick
+	// 直接跳过。闸的释放在**真实调用**返回时（含被弃子后迟到的返回），
+	// 而不是弃子判定时。
+	var inFlight atomic.Bool
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
@@ -95,13 +116,19 @@ func (b *RedisBackend) renewLoop(ctx context.Context, member string, stop <-chan
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := b.client.ZAddArgs(ctx, b.processingKey(), goredis.ZAddArgs{
-				XX: true,
-				Members: []goredis.Z{{
-					Score:  float64(b.leaseDeadline(time.Now().Unix())),
-					Member: member,
-				}},
-			}).Err(); err != nil {
+			if !inFlight.CompareAndSwap(false, true) {
+				continue
+			}
+			if err := bestEffortRedisTimeout("lease_renew", renewTimeout, func(callCtx context.Context) error {
+				defer inFlight.Store(false)
+				return b.client.ZAddArgs(callCtx, b.processingKey(), goredis.ZAddArgs{
+					XX: true,
+					Members: []goredis.Z{{
+						Score:  float64(b.leaseDeadline(time.Now().Unix())),
+						Member: member,
+					}},
+				}).Err()
+			}); err != nil {
 				// 续租失败只记日志：下个周期重试；连续失败到租约真正过期时，
 				// 由回扫兜底重投（at-least-once 语义退化为旧行为，不会丢）。
 				log.Error("lease renew failed", "member", member, "err", err)
@@ -173,10 +200,18 @@ func (b *RedisBackend) reapExpiredLeases(ctx context.Context) {
 
 // requeueLeasesOnShutdown 停机时把本地 processing 中属于本进程可能未完成的
 // 租约任务提前摘掉并回投（best-effort）。任一实例的回扫也能捡到，这里是加速。
+//
+// 整轮回扫限时 requeueShutdownWindow（#121）：reapExpiredLeases 内部是
+// ZRangeByScore + 逐 member 串行 pipeline，黑洞（网络分区）下 N 个租约原本
+// 会串行阻塞到 N×ReadTimeout，把 Start 退出路径挂死。限时是真实墙钟约束
+// （go-redis 默认丢弃调用方 ctx deadline，裸 WithTimeout 是虚构的），套
+// bestEffortRedisTimeout（select + 弃子 goroutine）实现。超窗放弃不破坏
+// 语义：租约仍在 processing 集里，由任意实例的 reapLoop 按到期时间兜底捡回。
 func (b *RedisBackend) requeueLeasesOnShutdown() {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	b.reapExpiredLeases(ctx)
+	_ = bestEffortRedisTimeout("requeue_leases_shutdown", requeueShutdownWindow, func(ctx context.Context) error {
+		b.reapExpiredLeases(ctx)
+		return nil
+	})
 }
 
 // reapLoop 周期回扫过期租约。
