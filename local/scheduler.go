@@ -14,6 +14,21 @@ import (
 // ErrDuplicateSpec 表示同一个 cron 表达式被重复注册。
 var ErrDuplicateSpec = errors.New("local: cron spec already scheduled")
 
+// ErrUnsatisfiableSpec 表示 cron 表达式语法合法但**永无触发点**（#123），
+// 例如 `0 0 31 2 *`（2 月永无 31 日）。
+//
+// pkg/timex/cron 的 SpecSchedule.Next 对这类表达式静默返回零值——解析不报错，
+// 但调度器永远算不出首个触发点：Schedule 返回 nil、Start 正常、日志安静、
+// 任务永不执行，排障时唯一线索是「什么都没发生」。调度器正是 cron 库注释里
+// 说的「消费 Next 前应判 IsZero」的那个消费方，必须把不可满足上升为用户可见
+// 信号（与 ErrDuplicateSpec 的「不静默覆盖」同一防呆哲学）。
+//
+// 判定口径 = 「从注册时刻起 5 年内求不出首个触发点即报错」：这与调度循环
+// 实际消费 Next 的搜索上限一致——超出该上限的表达式对本调度器而言**事实上**
+// 永不触发（如「2 月 29 日且逢周日」这类超长间隔表达式，返回错误是如实
+// 描述调度行为，而非过度拒绝）。
+var ErrUnsatisfiableSpec = errors.New("local: cron spec can never fire")
+
 // Task 是被 cron 触发的任务函数。
 //
 // at 为本次触发的计划时间（cron 计算出的到期点），可用于日志与幂等键。
@@ -140,6 +155,11 @@ func New(cfg Config) (*Scheduler, error) {
 //
 // 同一个 spec 重复注册返回 ErrDuplicateSpec（不静默覆盖：覆盖会悄悄丢掉
 // 原处理函数，且调用方难以察觉）。要换处理函数请先 Unschedule。
+//
+// 语法合法但永无触发点的表达式（如 `0 0 31 2 *`）返回
+// ErrUnsatisfiableSpec（#123，不静默接受）：此前这类 spec 注册成功后永不
+// 触发且无任何信号。判定方式是注册前用注入时钟试算一次首个触发点——
+// 求不出（Next 返回零值）即报错，与调度循环实际的消费口径一致。
 func (s *Scheduler) Schedule(spec string, fn Task) error {
 	if fn == nil {
 		return errors.New("local: nil task")
@@ -152,6 +172,12 @@ func (s *Scheduler) Schedule(spec string, fn Task) error {
 		if ss, ok := sched.(*cron.SpecSchedule); ok {
 			ss.Location = loc
 		}
+	}
+	// #123：可满足性校验。SpecSchedule.Next 对不可满足表达式静默返回零值，
+	// 调度器消费前必须兜住（见 ErrUnsatisfiableSpec）。试算用注入时钟——
+	// FakeClock 测试下判定点确定可复现。
+	if sched.Next(s.clock.Now()).IsZero() {
+		return fmt.Errorf("%w: %q", ErrUnsatisfiableSpec, spec)
 	}
 
 	s.mu.Lock()

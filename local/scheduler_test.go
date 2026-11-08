@@ -484,3 +484,35 @@ func TestScheduler_Start_ReturnsCtxErrOnCancel(t *testing.T) {
 		t.Fatalf("Stop: %v", err)
 	}
 }
+
+// TestScheduler_UnsatisfiableSpec 钉住 #123：语法合法但永无触发点的表达式
+// （如 `0 0 31 2 *`——2 月永无 31 日）必须在注册时报错，而不是静默接受后
+// 永不触发。SpecSchedule.Next 对这类输入静默返回零值、解析不报错，旧实现
+// 注册成功后日志永远安静、任务永不执行，排障时唯一线索是「什么都没发生」。
+// 与 ErrDuplicateSpec 的「不静默覆盖」同一防呆哲学：调度器是 cron 库注释里
+// 「消费 Next 前应判 IsZero」责任的兜底方，必须把不可满足上升为用户可见信号。
+func TestScheduler_UnsatisfiableSpec(t *testing.T) {
+	s, _ := newTestScheduler(t, Config{})
+	task := func(context.Context, time.Time) error { return nil }
+
+	err := s.Schedule("0 0 31 2 *", task)
+	if !errors.Is(err, ErrUnsatisfiableSpec) {
+		t.Fatalf("不可满足 spec = %v, want ErrUnsatisfiableSpec", err)
+	}
+
+	// 试算失败不产生死条目
+	s.mu.Lock()
+	n := len(s.entries)
+	s.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("不可满足 spec 被注册了：entries = %d, want 0", n)
+	}
+
+	// 可满足 spec 不受影响（含秒粒度与 @every 宏两条形态）
+	if err := s.Schedule("0 0 1 2 *", task); err != nil {
+		t.Fatalf("可满足 spec 被误拒: %v", err)
+	}
+	if err := s.Schedule("@every 1h", task); err != nil {
+		t.Fatalf("@every 被误拒: %v", err)
+	}
+}
