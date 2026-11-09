@@ -30,17 +30,6 @@ func waitMark(t *testing.T, mark <-chan string, timeout time.Duration) string {
 	}
 }
 
-// drainMark 非阻塞清空标记通道。
-func drainMark(mark chan string) {
-	for {
-		select {
-		case <-mark:
-		default:
-			return
-		}
-	}
-}
-
 // TestScheduleFor_TriggerSequence 钉住基础触发：业务键注册的任务按 cron
 // 表达式依次触发，与 spec 键形态行为一致。
 func TestScheduleFor_TriggerSequence(t *testing.T) {
