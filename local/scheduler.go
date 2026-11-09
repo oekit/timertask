@@ -105,6 +105,10 @@ type Scheduler struct {
 
 	mu      sync.Mutex
 	entries map[string]*entry
+	// keyed 是业务键形态的注册表（#129，ScheduleFor/UnscheduleFor/Reconcile）：
+	// 与 spec 键形态并存不互通——同一 spec 允许挂多个业务键（调度平台的
+	// 两个任务可以共用同一表达式，各自触发）。
+	keyed   map[string]*entry
 	started bool
 	stopped bool
 	taskCtx context.Context
@@ -142,6 +146,7 @@ func New(cfg Config) (*Scheduler, error) {
 		log:     cfg.Logger,
 		clock:   cfg.Clock,
 		entries: make(map[string]*entry),
+		keyed:   make(map[string]*entry),
 		stopCh:  make(chan struct{}),
 		sem:     make(chan struct{}, cfg.Concurrency),
 		wake:    make(chan struct{}, 1),
@@ -249,8 +254,11 @@ func (s *Scheduler) Start(ctx context.Context) error {
 	}
 	s.started = true
 	s.taskCtx = ctx
-	entries := make([]*entry, 0, len(s.entries))
+	entries := make([]*entry, 0, len(s.entries)+len(s.keyed))
 	for _, e := range s.entries {
+		entries = append(entries, e)
+	}
+	for _, e := range s.keyed {
 		entries = append(entries, e)
 	}
 	for range entries {
@@ -303,11 +311,15 @@ func (s *Scheduler) shutdown() {
 
 	s.mu.Lock()
 	s.stopped = true
-	entries := make([]*entry, 0, len(s.entries))
+	entries := make([]*entry, 0, len(s.entries)+len(s.keyed))
 	for _, e := range s.entries {
 		entries = append(entries, e)
 	}
+	for _, e := range s.keyed {
+		entries = append(entries, e)
+	}
 	s.entries = make(map[string]*entry)
+	s.keyed = make(map[string]*entry)
 	s.mu.Unlock()
 
 	for _, e := range entries {
@@ -360,8 +372,11 @@ func (s *Scheduler) run(ctx context.Context) {
 // dispatchDue 计算并派发所有已到期的触发点，返回下一个触发点时间（零值表示暂无）。
 func (s *Scheduler) dispatchDue(now time.Time) time.Time {
 	s.mu.Lock()
-	entries := make([]*entry, 0, len(s.entries))
+	entries := make([]*entry, 0, len(s.entries)+len(s.keyed))
 	for _, e := range s.entries {
+		entries = append(entries, e)
+	}
+	for _, e := range s.keyed {
 		entries = append(entries, e)
 	}
 	s.mu.Unlock()
@@ -419,7 +434,12 @@ func (s *Scheduler) execute(e *entry, at time.Time) {
 	defer func() { <-s.sem }()
 
 	if err := s.invoke(ctx, e, at); err != nil {
-		s.log.Error("cron task failed", "spec", e.spec, "at", at, "err", err)
+		// 业务键形态（#129）的条目带 key 日志，便于调度平台按任务 ID 排障
+		if e.key != "" {
+			s.log.Error("cron task failed", "spec", e.spec, "key", e.key, "at", at, "err", err)
+		} else {
+			s.log.Error("cron task failed", "spec", e.spec, "at", at, "err", err)
+		}
 	}
 }
 
@@ -444,8 +464,11 @@ func (s *Scheduler) notify() {
 // pendingCount 返回各 spec 待执行触发点的总数（测试观测用）。
 func (s *Scheduler) pendingCount() int {
 	s.mu.Lock()
-	entries := make([]*entry, 0, len(s.entries))
+	entries := make([]*entry, 0, len(s.entries)+len(s.keyed))
 	for _, e := range s.entries {
+		entries = append(entries, e)
+	}
+	for _, e := range s.keyed {
 		entries = append(entries, e)
 	}
 	s.mu.Unlock()
@@ -490,6 +513,8 @@ type entry struct {
 	spec     string
 	schedule cron.Schedule
 	task     Task
+	// key 是业务键形态（#129）的注册键；spec 键形态为空串。
+	key string
 
 	mu       sync.Mutex
 	cond     *sync.Cond
