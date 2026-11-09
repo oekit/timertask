@@ -41,6 +41,28 @@
 //   - 同一个 spec 重复 Schedule 返回 ErrDuplicateSpec（不静默覆盖：
 //     覆盖会悄悄丢掉原处理函数）。要换处理函数请先 Unschedule。
 //
+// # 业务键形态（动态条目管理，#129）
+//
+// spec 键形态是**静态注册表**：键即表达式、重复注册报错、改表达式要先
+// Unschedule 旧键——调用方得自己记 spec→业务标识的映射。调度平台形态的
+// 消费方（按任务 ID upsert、任务启停/改表达式时同步调度计划、多实例按
+// DB 期望集对账）请用业务键形态（与 spec 键形态并存不互通）：
+//
+//		sched.ScheduleFor("task-42", "0 9 * * 1-5", fn)  // 按 key upsert
+//		sched.UnscheduleFor("task-42")                   // 按 key 注销
+//		sched.Reconcile([]local.Entry{                   // 收敛到 DB 启用集
+//			{Key: "task-42", Spec: "0 9 * * 1-5", Task: fn},
+//			{Key: "task-43", Spec: "@every 30s", Task: fn2},
+//		})
+//
+//	  - 同 key 同 spec 重复 upsert 是**幂等空操作**（不重装、不重置触发基准）
+//	    ——@every 解析为相对间隔（ConstantDelaySchedule），周期性重装会把
+//	    下次触发时间不断后移，间隔长于重装周期的任务永不执行。换任务函数
+//	    请先 UnscheduleFor（Task 不可比，指纹只含 spec）；
+//	  - 同 key 改 spec ⇒ 摘旧装新（旧表达式立即停止触发）；
+//	  - Reconcile 单条 spec 失败不阻断其余条目的收敛（错误逐条汇总），
+//	    期望集内 key 重复 fail-closed（不做任何变更并报错）。
+//
 // # 示例
 //
 //	sched, err := local.New(local.Config{Concurrency: 2})
