@@ -2,6 +2,12 @@
 
 由 ekit v0.34.0（git.enjoye.top/enjoydream/ekit，冻结维护）拆分而来。所有 notable 变更记录如下。
 
+## [v0.3.0] — 2026-11-10
+
+- - feat(local): 按业务键的动态条目管理——ScheduleFor（同 key 同 spec 幂等）/UnscheduleFor/Reconcile 期望集收敛，单条坏 spec 不阻断收敛（#129）
+
+关联问题单：timertask#129。
+
 ## [v0.2.14] — 2026-11-09
 
 - fix(local): Schedule 拒绝永无触发点的 cron spec（#123）
