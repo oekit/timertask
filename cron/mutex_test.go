@@ -46,8 +46,8 @@ func TestLocalMutex_LeaseExpiry(t *testing.T) {
 	if err != nil || owner == "" {
 		t.Fatalf("首次获取应成功: owner=%q err=%v", owner, err)
 	}
-	if _, err := m.TryLock(context.Background(), "k", 10*time.Second); !errors.Is(err, ErrLockNotAcquired) {
-		t.Fatalf("未到期应被占用, got %v", err)
+	if _, terr := m.TryLock(context.Background(), "k", 10*time.Second); !errors.Is(terr, ErrLockNotAcquired) {
+		t.Fatalf("未到期应被占用, got %v", terr)
 	}
 
 	clock.Advance(11 * time.Second) // 租约过期

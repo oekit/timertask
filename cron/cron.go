@@ -495,18 +495,18 @@ func (s *Scheduler) fire(ctx context.Context, planID string, at time.Time) error
 
 	// ② 跨实例互斥（可选）：distlock 等经 Mutex 缝注入，未注入 = 单实例契约。
 	if s.cfg.mutex != nil {
-		owner, err := s.cfg.mutex.TryLock(ctx, key, ttl)
+		owner, merr := s.cfg.mutex.TryLock(ctx, key, ttl)
 		switch {
-		case errors.Is(err, ErrLockNotAcquired):
+		case errors.Is(merr, ErrLockNotAcquired):
 			// 同触发点已由他实例认领/执行：让位，台账可观测（跨实例恰好
 			// 一次的正常形态）。
 			s.recordSkip(ctx, planID, trigger, nil)
 			s.log.Debug("exec slot taken by other instance", "plan", planID, "trigger", trigger)
 			return nil
-		case err != nil:
+		case merr != nil:
 			// 互斥设施故障：fail-closed 跳过（宁可漏跑一轮可补发，不可双跑）。
-			s.recordSkip(ctx, planID, trigger, err)
-			s.log.Error("exec mutex failed, trigger skipped", "plan", planID, "trigger", trigger, "err", err)
+			s.recordSkip(ctx, planID, trigger, merr)
+			s.log.Error("exec mutex failed, trigger skipped", "plan", planID, "trigger", trigger, "err", merr)
 			return nil
 		case owner == "":
 			// 防御：同上，空 ownerID 按未获得处置。
