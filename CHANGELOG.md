@@ -8,6 +8,10 @@
 
 关联问题单：oekit/timertask#150。
 
+- fix(redis): 优雅停机的 claim 交接点 + 中断收尾——worker 抢走的 localQueue 任务要么执行、要么回灌，不再静默丢弃或进假死信（#151）
+
+关联问题单：oekit/timertask#151。
+
 ## [v0.3.2] — 2026-11-10
 
 - - build: 依赖地板对齐（floor sync，无代码变更）
