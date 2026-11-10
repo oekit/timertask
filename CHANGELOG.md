@@ -12,6 +12,10 @@
 
 关联问题单：oekit/timertask#151。
 
+- fix(redis): WithClock 对 RedisBackend 生效——BackendConfig 下发 Clock，redis 侧时间判断收敛到注入时钟（#152）
+
+关联问题单：oekit/timertask#152。
+
 ## [v0.3.2] — 2026-11-10
 
 - - build: 依赖地板对齐（floor sync，无代码变更）

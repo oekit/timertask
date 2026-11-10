@@ -124,7 +124,7 @@ func (b *RedisBackend) renewLoop(ctx context.Context, member string, stop <-chan
 				return b.client.ZAddArgs(callCtx, b.processingKey(), goredis.ZAddArgs{
 					XX: true,
 					Members: []goredis.Z{{
-						Score:  float64(b.leaseDeadline(time.Now().Unix())),
+						Score:  float64(b.leaseDeadline(b.now().Unix())), // #152
 						Member: member,
 					}},
 				}).Err()
@@ -140,7 +140,7 @@ func (b *RedisBackend) renewLoop(ctx context.Context, member string, stop <-chan
 // reapExpiredLeases 把租约到期的任务按 RetryCount 重投回分片 ZSet。
 // 崩溃前未 Ack 的任务由本回扫捡回，实现 at-least-once（可容忍重复，调用方幂等）。
 func (b *RedisBackend) reapExpiredLeases(ctx context.Context) {
-	now := time.Now().Unix()
+	now := b.now().Unix() // #152：过期判定走注入时钟
 	pkey := b.processingKey()
 	members, err := b.client.ZRangeByScore(ctx, pkey, &goredis.ZRangeBy{
 		Min:    "0",

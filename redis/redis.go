@@ -95,6 +95,11 @@ type RedisBackend struct {
 	delivery          timertask.DeliveryMode
 	visibilityTimeout time.Duration
 
+	// clock 时钟抽象（#152）：到点扫描、租约 deadline、回扫、死信 score 等
+	// 任务时间判断单源；nil 取真实时钟。停机限时（bestEffortRedisTimeout /
+	// requeueShutdownWindow）是真实墙钟约束，**不**走注入时钟。
+	clock timertask.Clock
+
 	// 本地队列：携带原始 ZSet member，可靠模式 Ack 时使用
 	localQueue chan *claim
 	stopChan   chan struct{}
@@ -132,6 +137,7 @@ func NewRedisBackend(buzType string, client goredis.UniversalClient, handler tim
 		retryDelay:        cfg.RetryDelay,
 		delivery:          cfg.Delivery,
 		visibilityTimeout: cfg.VisibilityTimeout,
+		clock:             cfg.Clock,
 		localQueue:        make(chan *claim, 100000),
 		stopChan:          make(chan struct{}),
 	}
@@ -409,7 +415,7 @@ func (b *RedisBackend) consumeRemoteLoop(ctx context.Context) {
 }
 
 func (b *RedisBackend) consumeRemoteOnce(ctx context.Context) {
-	now := time.Now().Unix()
+	now := b.now().Unix() // #152：到点判断走注入时钟
 
 	// 只扫描当前负责的分片
 	shards := b.shardManager.GetMyShards()
@@ -646,7 +652,7 @@ func (b *RedisBackend) sendToDeadLetter(task *timertask.Task) {
 		key := fmt.Sprintf(deadLetterKey, b.buzType)
 		pipe := b.client.Pipeline()
 		pipe.ZAdd(ctx, key, goredis.Z{
-			Score:  float64(time.Now().Unix()),
+			Score:  float64(b.now().Unix()), // #152：死信 score 走注入时钟
 			Member: string(data),
 		})
 		// 按失败时间只保留最近 deadLetterMaxLen 条
@@ -698,6 +704,16 @@ func bestEffortRedisTimeout(op string, timeout time.Duration, fn func(ctx contex
 		log.Warn("best-effort redis write timed out, abandoned", "op", op, "timeout", timeout)
 		return ctx.Err()
 	}
+}
+
+// now 返回注入时钟的当前时间（#152）：WithClock 对 RedisBackend 生效，
+// 任务时间判断（到点扫描、租约 deadline、回扫、死信 score）单源走这里。
+// nil 取真实时钟（结构体字面量构造的测试路径兜底）。
+func (b *RedisBackend) now() time.Time {
+	if b.clock == nil {
+		return time.Now()
+	}
+	return b.clock.Now()
 }
 
 // parseTask 解析任务数据。
