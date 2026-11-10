@@ -1,10 +1,10 @@
 # AGENTS.md — oekit/timertask
 
-> 分片定时任务（FNV-1a、心跳续约）；v0.1.5 起可选可靠投递 DeliveryAtLeastOnce（租约 + Ack + 可见性超时；过期租约回扫重投/死信、停机 best-effort 收租，v0.1.7 接入生命周期真正生效）；v0.2.0 起 **Redis 后端迁至嵌套模块 timertask/redis**（根包不再引 go-redis/logx/concurrency，require 仅 pkg——import timertask 与 import timertask/local 的模块依赖面均无 redis，纯 stdlib 嵌入式场景可用）+ **新增 local 子包 cron 调度器 Scheduler**（表达式复用 pkg/timex/cron 不另写一份；并发度/CatchUp 补跑/退出语义明确，FakeClock 假时钟驱动、触发点序列可确定性断言）；v0.3.4 起 **ScheduleFor 幂等空操作放行 nil Task**（与 Reconcile「spec 未变时 Task 被忽略」同口径，纯表达式 upsert 不再被入口拒绝）；redis/v0.2.19 起 **租约回投 Lua 原子化**（requeueLeaseScript 先回投成功再摘租约，回投写命令级半失败退化为重复而非丢失，reapExpiredLeases 与 requeueClaim 同面）
-> 当前版本：`v0.3.4` · module：`github.com/oekit/timertask` · org：[oekit = Open Easy Kit](https://oekit.github.io)
+> 分片定时任务（FNV-1a、心跳续约）；v0.1.5 起可选可靠投递 DeliveryAtLeastOnce（租约 + Ack + 可见性超时；过期租约回扫重投/死信、停机 best-effort 收租，v0.1.7 接入生命周期真正生效）；v0.2.0 起 **Redis 后端迁至嵌套模块 timertask/redis**（根包不再引 go-redis/logx/concurrency，require 仅 pkg——import timertask 与 import timertask/local 的模块依赖面均无 redis，纯 stdlib 嵌入式场景可用）+ **新增 local 子包 cron 调度器 Scheduler**（表达式复用 pkg/timex/cron 不另写一份；并发度/CatchUp 补跑/退出语义明确，FakeClock 假时钟驱动、触发点序列可确定性断言）；v0.3.4 起 **ScheduleFor 幂等空操作放行 nil Task**（与 Reconcile「spec 未变时 Task 被忽略」同口径，纯表达式 upsert 不再被入口拒绝）；redis/v0.2.19 起 **租约回投 Lua 原子化**（requeueLeaseScript 先回投成功再摘租约，回投写命令级半失败退化为重复而非丢失，reapExpiredLeases 与 requeueClaim 同面）；v0.4.0 起 **timertask/cron 动态 cron 装配子包**（#159）——`Plan{ID,Spec,Fingerprint,Enabled}` 期望集 + Reconcile 指纹 diff 增量重装（指纹未变不重置 @every 触发基准）+ Upsert/Remove 运行期增改删 + StartReconcile 启动清扫（WithStaleSweep，zeus FailStaleRunning 同序）与周期对账 + **执行互斥**（Mutex 契约与 redisx/distlock.Locker 同形可选接入 + LocalMutex 进程内租约；slot 认领语义——触发点恰好一次；锁 TTL 预算公式单一出处 RetryBudget.LockTTL = 全部尝试+全部退避+余量）+ **运行台账**（RunRecord 四态可辨 + Ledger 外置缝 + MemLedger/RunHistory），触发引擎复用 local.Scheduler，根模块 require 仍仅 pkg
+> 当前版本：`v0.4.0` · module：`github.com/oekit/timertask` · org：[oekit = Open Easy Kit](https://oekit.github.io)
 
 ## 本仓包含
-`interface.go`、`local.go`（本地延迟任务后端）、`logging.go`、`local/`（cron 调度器子包：scheduler.go + clock.go）、`redis/`（**嵌套模块** `github.com/oekit/timertask/redis`：Redis 后端 + 分片 + 可靠投递）
+`interface.go`、`local.go`（本地延迟任务后端）、`logging.go`、`local/`（cron 调度器子包：scheduler.go + clock.go）、`cron/`（动态 cron 装配子包：计划收敛 + 执行互斥 + 运行台账，见 doc.go）、`redis/`（**嵌套模块** `github.com/oekit/timertask/redis`：Redis 后端 + 分片 + 可靠投递）
 
 ## 硬规则速览（全矩阵适用）
 

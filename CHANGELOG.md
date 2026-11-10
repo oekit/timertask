@@ -1,3 +1,12 @@
+## [v0.4.0] — 2026-11-11
+
+- feat(cron): 新增 `timertask/cron` 动态 cron 装配子包（#159）——「多实例动态 cron 装配 + 执行互斥 + 运行台账」三缺口单点收编（下游 3 处各自手搓调度器的公共面）：`Plan{ID,Spec,Fingerprint,Enabled}` 期望集 + `Reconcile` 指纹 diff 增量重装（指纹未变幂等空操作、不重置 @every 触发基准——防周期重装把长间隔任务永不触发；指纹变化摘旧装新）+ `Upsert/Remove` 运行期单条增改删 + `StartReconcile` 启动清扫（`WithStaleSweep`，zeus/task FailStaleRunning「启动清扫+补发事件」同序）与周期对账循环（listFn 失败/单条坏 spec 只记日志不中断，errors.Join 逐条汇总）。触发引擎复用同模块 local.Scheduler 既有基建（表达式解析/catch-up/并发度/假时钟），根模块 require 仍仅 pkg（go.mod 零变更）。
+- feat(cron): 执行互斥进库（#159）——`Mutex` 最小契约（TryLock/Unlock 与 redisx/distlock.Locker 同形，**可选依赖 distlock 的缝**：仓内不引 redisx，distlock.Locker 包一层哨兵映射即接入，godoc 附 6 行适配示例）+ `LocalMutex` 进程内租约实现（内建 slot 守护 + 跨实例测试共享假件）。互斥语义 = **slot 认领**：触发点租约不随执行完成释放（兼作「已认领」标记），迟到重复触发在租约有效期内一律让位——同一触发点跨实例恰好一次；崩溃实例租约到期自动接管（与仓内 at-least-once 租约同型）；互斥设施故障 fail-closed 跳过（宁可漏跑一轮可补发，不可双跑）。**锁 TTL 预算公式单一出处** `RetryBudget.LockTTL() = Attempts*Timeout + TotalBackoff() + Slack`（与 zeus/task execLockTTL 同口径收编——此前散在下游手算，口径漂移即互斥提前过期、同 slot 双跑）。
+- feat(cron): 运行台账（#159）——`RunRecord{PlanID,Trigger,Instance,StartedAt,EndedAt,Err,Skipped}`（成功/失败/让位/设施故障四态可辨、Instance 多实例归因）+ `Ledger` 外置落库缝（与内置有界 `MemLedger` 并联，RunHistory 读取面），台账 panic 收编不影响触发。Executor 的 trigger 串（RFC3339 秒精度）与互斥键/台账键三同源，业务可直接作幂等键。
+- 现代语言特性：sync.OnceFunc 收编触发引擎拉起与停机收口两处 once 语义（startEngineOnce/stopOnce，天然幂等）；errors.Join 聚合 Reconcile 逐条失败（与 local.Reconcile 同款，多错误一次给出）；min/max 内建收编 RetryBudget 归一钳制（Attempts/Timeout/Backoff）；for range int 收敛 MemLedger 环形回卷拷贝与并发争抢测试的计数循环。
+
+关联问题单：oekit/timertask#159。
+
 ## [v0.3.4] — 2026-11-11
 
 - fix(local): ScheduleFor 对幂等空操作的 nil Task 不再报错（#155）——`fn == nil` 检查从入口前置移入「需要安装/重装」分支，与 Reconcile「spec 未变时 Task 被忽略」同口径：同 key 同 spec 的 `ScheduleFor(key, spec, nil)` 幂等空操作放行（纯表达式 upsert，任务函数以首次注册为准），新 key / spec 变化仍要求 Task 非 nil（与 Reconcile 安装分支同序）。修复前入口在幂等判定之前就报 "nil task"，两个入口口径分裂，调度平台型消费方被迫 UnscheduleFor 再注册（摘旧装新重置触发基准——@every 后移陷阱）或塞哑函数（同样重置基准）。现代语言特性：本次改动面 errors.Join 无新增聚合点（Reconcile 逐条汇总已是 errors.Join 形态）。本 train 同时发布 redis/v0.2.19（#157 的完整修复叙事在该版本节）。
