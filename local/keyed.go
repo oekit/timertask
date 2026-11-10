@@ -28,15 +28,21 @@ type Entry struct {
 //
 // 语义（指纹幂等，zeus 实证的同款防呆）：
 //
-//   - key 未注册 ⇒ 安装；
+//   - key 未注册 ⇒ 安装（Task 必填）；
 //   - key 已注册且 spec 未变 ⇒ **幂等空操作**——不重装、不重置触发基准。
 //     重装会把 entry 的 lastFire 重置到此刻：@every 解析为
 //     ConstantDelaySchedule（相对基准的固定间隔），「周期性重装」会把间隔
 //     长于重装周期的任务的下次触发时间不断往后推——任务永不执行。因此
 //     **换任务函数（Task 不可比）请先 UnscheduleFor 再 ScheduleFor**，
 //     同 spec 重复调用本函数不会生效；
-//   - key 已注册且 spec 变化 ⇒ 摘旧装新：旧表达式立即停止触发（正在执行
-//     的旧任务不打断，与 Unschedule 语义一致），新表达式从注册时刻起算。
+//   - key 已注册且 spec 变化 ⇒ 摘旧装新（Task 必填）：旧表达式立即停止
+//     触发（正在执行的旧任务不打断，与 Unschedule 语义一致），新表达式从
+//     注册时刻起算。
+//
+// Task 与 Reconcile 同口径（#155）：仅在「需要安装/重装」时使用，spec 未变
+// 的幂等空操作忽略 Task（fn 为 nil 亦放行，任务函数以首次注册为准）——纯
+// 表达式 upsert（ScheduleFor(key, spec, nil)）由此可用；需要安装/重装而
+// fn 为 nil 时返回错误。
 //
 // 同一 spec 可挂多个业务键（两个任务共用同一表达式，各自触发）；key 键与
 // spec 键互不可见——同一 spec 在两种形态下各注册一次会各自触发一次，混用
@@ -48,9 +54,6 @@ type Entry struct {
 func (s *Scheduler) ScheduleFor(key, spec string, fn Task) error {
 	if key == "" {
 		return errors.New("local: empty key")
-	}
-	if fn == nil {
-		return errors.New("local: nil task")
 	}
 	sched, err := cron.Parse(spec)
 	if err != nil {
@@ -74,8 +77,17 @@ func (s *Scheduler) ScheduleFor(key, spec string, fn Task) error {
 	old := s.keyed[key]
 	if old != nil && old.spec == spec {
 		// 指纹（spec）未变：幂等空操作（防 @every 重置，见函数注释）。
+		// Task 此时被忽略（nil 亦然，#155——与 Reconcile 的 unchanged 分支
+		// 同口径）。
 		s.mu.Unlock()
 		return nil
+	}
+	// nil 检查移入「需要安装/重装」分支（#155，与 Reconcile 的安装分支同序）：
+	// 全局前置检查会把「spec 未变、Task 以首次注册为准」的纯表达式 upsert
+	// 一并拒掉，与 Reconcile「spec 未变时 Task 被忽略」口径分裂。
+	if fn == nil {
+		s.mu.Unlock()
+		return errors.New("local: nil task")
 	}
 	if old != nil {
 		delete(s.keyed, key)
