@@ -8,7 +8,7 @@
 ## 安装
 
 ```bash
-go get github.com/oekit/timertask@v0.3.4
+go get github.com/oekit/timertask@v0.4.0
 # 需要 Redis 形态（嵌套模块，按需引入）：
 go get github.com/oekit/timertask/redis@v0.2.19
 ```
@@ -16,11 +16,14 @@ go get github.com/oekit/timertask/redis@v0.2.19
 ## 这个仓库做什么
 
 `timertask` 是**分片定时任务**：按任务 ID 哈希分片、支持秒级精度的延时任务、
-心跳续约防重复执行。三块能力：
+心跳续约防重复执行。四块能力：
 
 - **本地后端**（根包 `LocalBackend`）：进程内延迟任务队列，**零 Redis 依赖**
 - **cron 周期调度**（子包 `timertask/local`）：按 cron 表达式触发任务，表达式解析复用
   [pkg/timex/cron](https://github.com/oekit/pkg)；假时钟驱动，触发点序列可确定性断言
+- **动态 cron 装配**（子包 `timertask/cron`）：运行期增删改计划（指纹 diff 增量重装，
+  不重置 @every 触发基准）+ 多实例执行互斥（slot 认领恰好一次，distlock 可选接入）+
+  运行台账（执行历史/结果可观测）
 - **Redis 后端**（嵌套模块 `timertask/redis`）：跨实例分片 + 可靠投递（租约 + Ack + 可见性超时）
 
 > v0.2.0 起 **Redis 后端自根包迁至嵌套模块**——根模块依赖面只剩 `github.com/oekit/pkg`，
@@ -53,6 +56,30 @@ _ = sched.Schedule("0 3 * * *", func(ctx context.Context, at time.Time) error {
     return runNightly(ctx, at) // 按龄回收 / 事实合并 / 周期摘要
 })
 _ = sched.Start(ctx)
+```
+
+动态 cron 装配（`timertask/cron`，多实例调度平台形态）：
+
+```go
+import "github.com/oekit/timertask/cron"
+
+sched := cron.New(
+    func(ctx context.Context, planID, trigger string) error {
+        return runPlan(ctx, planID) // trigger（RFC3339）可直接作幂等键
+    },
+    cron.WithMutex(distAdapter{locker}), // redisx/distlock 等，见 cron.Mutex
+    cron.WithInstance("task-1"),
+)
+// 启动清扫 → 首轮对账 → 按周期收敛（指纹未变的计划不重装、不重置触发基准）
+if err := sched.StartReconcile(ctx, 30*time.Second, listFromDB); err != nil {
+    return err
+}
+defer sched.Close(context.Background())
+
+// 执行历史/结果可观测：
+for _, rec := range sched.RunHistory("") { // 让位/失败/成功四态可辨
+    fmt.Println(rec.PlanID, rec.Trigger, rec.Instance, rec.Err)
+}
 ```
 
 ## 从 v0.1.x 迁移到 v0.2.0（Redis 后端迁嵌套模块）
