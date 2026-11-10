@@ -1,8 +1,10 @@
-# Changelog — oekit/timertask
+## [v0.3.3] — 2026-11-11
 
-由 ekit v0.34.0（git.enjoye.top/enjoydream/ekit，冻结维护）拆分而来。所有 notable 变更记录如下。
+- fix: BackendConfig 增加 Clock 下发通道（#152）——WithClock 对 RedisBackend 静默 no-op 的根因是 ResolveOptions 不下发 Clock、redis 侧时间判断硬编码 time.Now；API 增量（可选字段，向后兼容），配合 redis/v0.2.18 使 FakeClock 注入对 Redis 侧生效。本 train 同时发布 redis/v0.2.18（#150、#151、#152 的完整修复叙事在该版本节）。
 
-## [Unreleased]
+关联问题单：oekit/timertask#150、oekit/timertask#151、oekit/timertask#152。
+
+## [redis/v0.2.18] — 2026-11-11
 
 - fix(redis): reapExpiredLeases 重投反转为「先回投、后摘租约」——重投窗口内瞬时错误退化为重复投递而非任务永久丢失（#150）
 
@@ -15,6 +17,8 @@
 - fix(redis): WithClock 对 RedisBackend 生效——BackendConfig 下发 Clock，redis 侧时间判断收敛到注入时钟（#152）
 
 关联问题单：oekit/timertask#152。
+
+- build: 依赖地板对齐——github.com/oekit/timertask v0.3.3（随本 train 发布）。
 
 ## [v0.3.2] — 2026-11-10
 

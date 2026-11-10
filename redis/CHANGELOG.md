@@ -2,6 +2,22 @@
 
 由 oekit/timertask v0.2.0 拆分而来（Redis 形态独立成模块）。
 
+## [v0.2.18] — 2026-11-11
+
+- fix(redis): reapExpiredLeases 重投反转为「先回投、后摘租约」——重投窗口内瞬时错误退化为重复投递而非任务永久丢失（#150）
+
+关联问题单：oekit/timertask#150。
+
+- fix(redis): 优雅停机的 claim 交接点 + 中断收尾——worker 抢走的 localQueue 任务要么执行、要么回灌，不再静默丢弃或进假死信（#151）
+
+关联问题单：oekit/timertask#151。
+
+- fix(redis): WithClock 对 RedisBackend 生效——BackendConfig 下发 Clock，redis 侧时间判断收敛到注入时钟（#152）
+
+关联问题单：oekit/timertask#152。
+
+- build: 依赖地板对齐——github.com/oekit/timertask v0.3.3（随本 train 发布）。
+
 ## [v0.2.17] — 2026-11-10
 
 - 随本次 train 一并发布（只发嵌套模块，父模块本次不发版）
