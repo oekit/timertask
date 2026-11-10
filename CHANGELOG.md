@@ -2,6 +2,10 @@
 
 由 ekit v0.34.0（git.enjoye.top/enjoydream/ekit，冻结维护）拆分而来。所有 notable 变更记录如下。
 
+## [redis/v0.2.17] — 2026-11-10
+
+- - build: 嵌套地板发布——timertask v0.3.0（floor sync，无代码变更）
+
 ## [v0.3.0] — 2026-11-10
 
 - - feat(local): 按业务键的动态条目管理——ScheduleFor（同 key 同 spec 幂等）/UnscheduleFor/Reconcile 期望集收敛，单条坏 spec 不阻断收敛（#129）
