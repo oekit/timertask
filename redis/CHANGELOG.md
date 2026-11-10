@@ -2,6 +2,14 @@
 
 由 oekit/timertask v0.2.0 拆分而来（Redis 形态独立成模块）。
 
+## [v0.2.19] — 2026-11-11
+
+- fix(redis): 租约回投收敛为 Lua 原子脚本 requeueLeaseScript——「先回投成功再摘租约」由服务端保证，回投写命令级失败（OOM / maxmemory 逐出 / WRONGTYPE）不再把任务从分片 ZSet 与 processing 两边一起摘掉、不进死信（#157）。go-redis Pipeline() 非 MULTI/EXEC、逐条独立执行，#150 的命令顺序反转（先 ZAdd 后 ZRem）堵不住「ZAdd 失败 + ZRem 成功」的半失败腿；脚本内 redis.call 出错即中止（后续命令不执行）：ZAdd 失败 ⇒ ZRem 不执行、租约保留、下轮回扫再投；ZAdd 成功后 ZRem 失败 ⇒ 任务暂留两处、下轮回扫重复回投——两腿都退化为「重复」而非「丢失」，at-least-once 允许重复、不容忍丢失。reapExpiredLeases 与 requeueClaim 两条回投路径统一走该脚本（issue 关切的「同一操作两种顺序」收敛为同一原子面）。
+
+关联问题单：oekit/timertask#157。
+
+- refactor(redis): 现代语言特性贴合处（#157 随行）——min/max 内建收敛 4 处手写钳制（leaseDeadline 短租补偿、续租周期/续租限时、回扫周期），for range int 收敛 2 处计数循环（Start 的 worker 池拉起、PendingCount 的分片扫描）；errors.Join 本模块无新增多错误聚合点（逐任务失败按 kv 日志逐条上报，聚合反而劣化可观测面）。
+
 ## [v0.2.18] — 2026-11-11
 
 - fix(redis): reapExpiredLeases 重投反转为「先回投、后摘租约」——重投窗口内瞬时错误退化为重复投递而非任务永久丢失（#150）

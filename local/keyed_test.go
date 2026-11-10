@@ -84,6 +84,49 @@ func TestScheduleFor_IdempotentSameSpec_NoEveryReset(t *testing.T) {
 	}
 }
 
+// TestScheduleFor_NilTaskUnchanged_IdempotentNoOp 钉住 #155：与 Reconcile
+// 「spec 未变时 Task 被忽略」同口径——幂等空操作（同 key 同 spec）对 nil Task
+// 放行，nil 检查只拦「需要安装/重装」的调用。调度平台型消费方按 Reconcile
+// 语义用 ScheduleFor(key, spec, nil) 做纯表达式 upsert 的形态由此打通；修复前
+// 入口在幂等判定之前就报 "nil task"，用户被迫 UnscheduleFor 再注册（摘旧装新
+// 重置触发基准——恰是 @every 后移陷阱）或塞哑函数（同样重置基准）。
+func TestScheduleFor_NilTaskUnchanged_IdempotentNoOp(t *testing.T) {
+	s, clock := newTestScheduler(t, Config{})
+
+	mark := make(chan string, 8)
+	if err := s.ScheduleFor("k", "@every 10s", collectFires(mark, "keep")); err != nil {
+		t.Fatal(err)
+	}
+	start(t, s)
+
+	// 幂等空操作 + nil Task ⇒ 放行（Task 以首次注册为准，与 Reconcile 同口径）。
+	if err := s.ScheduleFor("k", "@every 10s", nil); err != nil {
+		t.Fatalf("同 key 同 spec 的 nil Task 应幂等空操作放行（#155），got %v", err)
+	}
+
+	// 不重装、不重置触发基准、Task 未被清空：T+10 照常由原 Task 触发。
+	clock.Advance(10 * time.Second)
+	if got := waitMark(t, mark, 2*time.Second); got != "keep@10" {
+		t.Fatalf("#155 回归：幂等空操作后触发标记 = %q，期望 keep@10（基准未重置、Task 保留）", got)
+	}
+
+	// nil Task 只拦「需要安装/重装」（与 Reconcile 的安装分支同序）。
+	if err := s.ScheduleFor("new-key", "@every 10s", nil); err == nil {
+		t.Error("新 key 安装缺 Task 应报错")
+	}
+	if s.UnscheduleFor("new-key") {
+		t.Error("缺 Task 的新 key 不应被安装")
+	}
+	if err := s.ScheduleFor("k", "@every 20s", nil); err == nil {
+		t.Error("spec 变化的重装缺 Task 应报错")
+	}
+	// 失败的 upsert 不影响既有注册：k 仍按原 spec 触发（基准未被重置）。
+	clock.Advance(10 * time.Second)
+	if got := waitMark(t, mark, 2*time.Second); got != "keep@20" {
+		t.Fatalf("失败 upsert 影响了既有注册：标记 = %q，期望 keep@20", got)
+	}
+}
+
 // TestScheduleFor_SpecChangeReinstalls 钉住 upsert 的另一面：spec 变化 ⇒
 // 摘旧装新——旧表达式立即停止触发，新表达式从注册时刻起算。
 func TestScheduleFor_SpecChangeReinstalls(t *testing.T) {

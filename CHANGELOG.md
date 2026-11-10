@@ -1,3 +1,17 @@
+## [v0.3.4] — 2026-11-11
+
+- fix(local): ScheduleFor 对幂等空操作的 nil Task 不再报错（#155）——`fn == nil` 检查从入口前置移入「需要安装/重装」分支，与 Reconcile「spec 未变时 Task 被忽略」同口径：同 key 同 spec 的 `ScheduleFor(key, spec, nil)` 幂等空操作放行（纯表达式 upsert，任务函数以首次注册为准），新 key / spec 变化仍要求 Task 非 nil（与 Reconcile 安装分支同序）。修复前入口在幂等判定之前就报 "nil task"，两个入口口径分裂，调度平台型消费方被迫 UnscheduleFor 再注册（摘旧装新重置触发基准——@every 后移陷阱）或塞哑函数（同样重置基准）。现代语言特性：本次改动面 errors.Join 无新增聚合点（Reconcile 逐条汇总已是 errors.Join 形态）。本 train 同时发布 redis/v0.2.19（#157 的完整修复叙事在该版本节）。
+
+关联问题单：oekit/timertask#155。
+
+## [redis/v0.2.19] — 2026-11-11
+
+- fix(redis): 租约回投收敛为 Lua 原子脚本 requeueLeaseScript——「先回投成功再摘租约」由服务端保证，回投写命令级失败（OOM / maxmemory 逐出 / WRONGTYPE）不再把任务从分片 ZSet 与 processing 两边一起摘掉、不进死信（#157）。go-redis Pipeline() 非 MULTI/EXEC、逐条独立执行，#150 的命令顺序反转（先 ZAdd 后 ZRem）堵不住「ZAdd 失败 + ZRem 成功」的半失败腿；脚本内 redis.call 出错即中止（后续命令不执行）：ZAdd 失败 ⇒ ZRem 不执行、租约保留、下轮回扫再投；ZAdd 成功后 ZRem 失败 ⇒ 任务暂留两处、下轮回扫重复回投——两腿都退化为「重复」而非「丢失」，at-least-once 允许重复、不容忍丢失。reapExpiredLeases 与 requeueClaim 两条回投路径统一走该脚本（issue 关切的「同一操作两种顺序」收敛为同一原子面）。
+
+关联问题单：oekit/timertask#157。
+
+- refactor(redis): 现代语言特性贴合处（#157 随行）——min/max 内建收敛 4 处手写钳制（leaseDeadline 短租补偿、续租周期/续租限时、回扫周期），for range int 收敛 2 处计数循环（Start 的 worker 池拉起、PendingCount 的分片扫描）；errors.Join 本模块无新增多错误聚合点（逐任务失败按 kv 日志逐条上报，聚合反而劣化可观测面）。
+
 ## [v0.3.3] — 2026-11-11
 
 - fix: BackendConfig 增加 Clock 下发通道（#152）——WithClock 对 RedisBackend 静默 no-op 的根因是 ResolveOptions 不下发 Clock、redis 侧时间判断硬编码 time.Now；API 增量（可选字段，向后兼容），配合 redis/v0.2.18 使 FakeClock 注入对 Redis 侧生效。本 train 同时发布 redis/v0.2.18（#150、#151、#152 的完整修复叙事在该版本节）。

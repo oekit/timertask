@@ -284,7 +284,7 @@ func (b *RedisBackend) Start(ctx context.Context) error {
 	}
 
 	// 启动本地 Worker 池
-	for i := 0; i < b.workers; i++ {
+	for range b.workers {
 		async.GoSafe(func() { b.workerLoop(ctx) })
 	}
 
@@ -357,6 +357,10 @@ func (b *RedisBackend) requeuePendingOnShutdown() {
 // 保留原 EndTime；at-least-once 时同时摘掉 processing 租约），返回是否成功。
 // 优雅停机的两条路径复用：localQueue 回灌（requeuePendingOnShutdown）与
 // claim 后未及入队的在途任务（consumeRemoteOnce 的停机窗口，#96）。
+//
+// at-least-once 的「回投 + 摘租约」与 reapExpiredLeases 共用同一原子脚本
+// （requeueLeaseScript，#157：先回投成功再摘租约，半失败不丢任务）；
+// at-most-once 只有回投单命令，无半失败窗口。
 func (b *RedisBackend) requeueClaim(ctx context.Context, c *claim) bool {
 	task := c.task
 	data, err := json.Marshal(task)
@@ -365,16 +369,19 @@ func (b *RedisBackend) requeueClaim(ctx context.Context, c *claim) bool {
 		return false
 	}
 	key := b.taskKey(task.ID)
-	pipe := b.client.Pipeline()
-	pipe.ZAdd(ctx, key, goredis.Z{
-		Score:  float64(task.EndTime),
-		Member: string(data),
-	})
-	if b.delivery == timertask.DeliveryAtLeastOnce {
-		pipe.ZRem(ctx, b.processingKey(), c.member)
+	if b.delivery != timertask.DeliveryAtLeastOnce {
+		if err := b.client.ZAdd(ctx, key, goredis.Z{
+			Score:  float64(task.EndTime),
+			Member: string(data),
+		}).Err(); err != nil {
+			log.Error("requeue ZAdd failed", "taskID", task.ID, "err", err)
+			return false
+		}
+		return true
 	}
-	if _, err := pipe.Exec(ctx); err != nil {
-		log.Error("requeue ZAdd failed", "taskID", task.ID, "err", err)
+	if err := requeueLeaseScript.Run(ctx, b.client, []string{key, b.processingKey()},
+		task.EndTime, string(data), c.member).Err(); err != nil {
+		log.Error("requeue failed", "taskID", task.ID, "err", err)
 		return false
 	}
 	return true
@@ -729,7 +736,7 @@ func (b *RedisBackend) parseTask(data string) *timertask.Task {
 // PendingCount 返回队列中待处理任务数（所有分片的 ZSet 大小之和）。
 func (b *RedisBackend) PendingCount(ctx context.Context) (int64, error) {
 	var total int64
-	for i := 0; i < b.buckets; i++ {
+	for i := range b.buckets {
 		count, err := b.client.ZCard(ctx, b.shardKey(i)).Result()
 		if err != nil {
 			return total, fmt.Errorf("pending count shard %d: %w", i, err)

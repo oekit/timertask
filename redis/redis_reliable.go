@@ -33,6 +33,30 @@ var claimLeaseScript = goredis.NewScript(`
 	end
 `)
 
+// requeueLeaseScript 原子回投：先 ZAdd 回分片 ZSet、再 ZRem 摘 processing 租约
+// （#157，reapExpiredLeases 与 requeueClaim 两条回投路径共用同一原子面）。
+//
+// 「先回投成功再摘租约」不能靠同一条 pipeline 的命令顺序：go-redis
+// Pipeline() 非 MULTI/EXEC、逐条独立执行，回投的 ZAdd 命令级失败（OOM /
+// maxmemory 逐出 / WRONGTYPE）而摘租约的 ZRem 照常执行时，任务从分片 ZSet
+// 与 processing 两边都被摘掉、不进死信——永久丢失，与 at-least-once
+// 「可容忍重复、不容忍丢失」的承诺相悖（#150 只反转了顺序，堵不住这条腿）。
+// 脚本内 redis.call 出错即中止（后续命令不执行、已执行命令不回滚）：
+//   - ZAdd 失败 ⇒ ZRem 不执行，租约保留、下轮回扫再投（不丢）；
+//   - ZAdd 成功后 ZRem 失败 ⇒ 任务暂留分片与 processing 两处，下轮回扫
+//     重复回投（at-least-once 允许重复）。
+//
+// 两个半失败腿都不丢任务。
+//
+// KEYS[1]=shard zset, KEYS[2]=processing
+// ARGV[1]=score (EndTime), ARGV[2]=回投 member（重试计数已递增的规范化 JSON）,
+// ARGV[3]=processing member（原租约 member）
+var requeueLeaseScript = goredis.NewScript(`
+	redis.call('zadd', KEYS[1], tonumber(ARGV[1]), ARGV[2])
+	redis.call('zrem', KEYS[2], ARGV[3])
+	return 1
+`)
+
 func (b *RedisBackend) processingKey() string {
 	return fmt.Sprintf(processingKeyPattern, b.buzType)
 }
@@ -64,10 +88,7 @@ func (b *RedisBackend) claimTaskWithLease(ctx context.Context, shardKey, member 
 // 活跃租约被误判过期重投。长度 ≥ 2s 保证跨边界后仍严格大于 now。
 func (b *RedisBackend) leaseDeadline(now int64) int64 {
 	secs := int64(b.visibilityTimeout / time.Second)
-	if secs < 2 {
-		return now + 2
-	}
-	return now + secs
+	return now + max(secs, 2)
 }
 
 // renewLoop 在 handler 执行期间周期续租（#93/#95）：把 processing 集中
@@ -92,14 +113,8 @@ func (b *RedisBackend) leaseDeadline(now int64) int64 {
 func (b *RedisBackend) renewLoop(ctx context.Context, member string, stop <-chan struct{}) {
 	// 续租周期取租约的 1/3（与回扫周期同比例）：任一跳的抖动都不会让
 	// deadline 落后于 now。
-	interval := b.visibilityTimeout / 3
-	if interval < 20*time.Millisecond {
-		interval = 20 * time.Millisecond
-	}
-	renewTimeout := interval
-	if renewTimeout > 2*time.Second {
-		renewTimeout = 2 * time.Second
-	}
+	interval := max(b.visibilityTimeout/3, 20*time.Millisecond)
+	renewTimeout := min(interval, 2*time.Second)
 	// 单飞闸（#122）：限时是弃子实现——被放弃的调用还会卡在客户端里直到
 	// 客户端自身的 ReadTimeout。interval 远小于 ReadTimeout 的配置下，若不
 	// 设闸，每个 tick 都会再弃一个卡死的调用，堆积弃子 goroutine 与连接。
@@ -185,15 +200,12 @@ func (b *RedisBackend) reapExpiredLeases(ctx context.Context) {
 			continue
 		}
 		key := b.taskKey(task.ID)
-		// 先回投、后摘租约（#150，与 requeueClaim 同款顺序）：pipeline 非
-		// MULTI/EXEC，中途瞬时错误时按此顺序失败退化为「重复投递」（任务
-		// 同时留在分片 ZSet 与 processing，回扫下轮再摘），而不是旧顺序
-		// 「先摘租约再回投」的「哪都不在 = 永久丢失」——at-least-once 允许
-		// 重复、不允许丢失。
-		pipe := b.client.Pipeline()
-		pipe.ZAdd(ctx, key, goredis.Z{Score: float64(task.EndTime), Member: string(data)})
-		pipe.ZRem(ctx, pkey, member)
-		if _, err := pipe.Exec(ctx); err != nil {
+		// 回投 + 摘租约走原子脚本（#157）：「先回投成功再摘租约」由服务端保证
+		// （细节见 requeueLeaseScript 注释）——回投写失败时租约保留、下轮回扫
+		// 再投；不可用同一条 pipeline 的命令顺序冒充原子面：非 MULTI/EXEC
+		// 逐条独立执行，「ZAdd 失败 + ZRem 成功」⇒ 两处皆空、永久丢失。
+		if err := requeueLeaseScript.Run(ctx, b.client, []string{key, pkey},
+			task.EndTime, string(data), member).Err(); err != nil {
 			log.Error("reap requeue failed", "taskID", task.ID, "err", err)
 			continue
 		}
@@ -220,10 +232,7 @@ func (b *RedisBackend) requeueLeasesOnShutdown() {
 // reapLoop 周期回扫过期租约。
 func (b *RedisBackend) reapLoop(ctx context.Context) {
 	// 回扫周期取租约的 1/3，避免过期任务长时间滞留
-	interval := b.visibilityTimeout / 3
-	if interval < time.Second {
-		interval = time.Second
-	}
+	interval := max(b.visibilityTimeout/3, time.Second)
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {

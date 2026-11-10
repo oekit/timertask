@@ -59,6 +59,9 @@
 //	    ——@every 解析为相对间隔（ConstantDelaySchedule），周期性重装会把
 //	    下次触发时间不断后移，间隔长于重装周期的任务永不执行。换任务函数
 //	    请先 UnscheduleFor（Task 不可比，指纹只含 spec）；
+//	  - Task 与 Reconcile 同口径（#155）：spec 未变的幂等空操作忽略 Task
+//	    （ScheduleFor(key, spec, nil) 的纯表达式 upsert 可用），需要安装/
+//	    重装（新 key / 改 spec）才要求 Task 非 nil；
 //	  - 同 key 改 spec ⇒ 摘旧装新（旧表达式立即停止触发）；
 //	  - Reconcile 单条 spec 失败不阻断其余条目的收敛（错误逐条汇总），
 //	    期望集内 key 重复 fail-closed（不做任何变更并报错）。
