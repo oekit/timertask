@@ -134,9 +134,10 @@ const (
 )
 
 // config 是延迟任务的通用配置。
-// Clock 是时钟抽象（[#78](https://github.com/oekit/timertask/issues/78)）：
-// LocalBackend 的时间判断走本接口，注入假时钟后「到点触发」场景不必真睡即可
-// 断言。与 local.Clock 同形（local 经别名归一到本定义，单一事实源）。
+// Clock 是时钟抽象（[#78](https://github.com/oekit/timertask/issues/78)、
+// [#152](https://github.com/oekit/timertask/issues/152)）：LocalBackend 与 Redis
+// 后端的时间判断都走本接口，注入假时钟后「到点触发」场景不必真睡即可断言。
+// 与 local.Clock 同形（local 经别名归一到本定义，单一事实源）。
 type Clock interface {
 	// Now 返回当前时间。
 	Now() time.Time
@@ -159,10 +160,12 @@ type config struct {
 	clock             Clock         // 时钟注入（#78）：nil 取 SystemClock{}——对齐 local/scheduler 的 Clock 形态
 }
 
-// WithClock 注入时钟（[#78](https://github.com/oekit/timertask/issues/78)）：
-// LocalBackend 的时间判断（CreateTime 缺省、扫描触发点）改走注入时钟，测试
-// 可注入 FakeClock 断言「到点触发」而不必真睡。nil/缺省取 SystemClock{}。
-// 与 local/scheduler 的 Clock 注入同一形态（此前同模块两形态两套哲学）。
+// WithClock 注入时钟（[#78](https://github.com/oekit/timertask/issues/78)、
+// [#152](https://github.com/oekit/timertask/issues/152)）：LocalBackend 的时间
+// 判断（CreateTime 缺省、扫描触发点）与 Redis 后端的时间判断（到点扫描、
+// 租约 deadline、回扫、死信 score）都改走注入时钟，测试可注入 FakeClock
+// 断言「到点触发」而不必真睡。nil/缺省取 SystemClock{}。与 local/scheduler
+// 的 Clock 注入同一形态（此前同模块两形态两套哲学）。
 func WithClock(clock Clock) TimerTaskOption {
 	return func(c *config) {
 		c.clock = clock
@@ -281,6 +284,10 @@ type BackendConfig struct {
 	Delivery DeliveryMode
 	// VisibilityTimeout at-least-once 模式的租约时长。
 	VisibilityTimeout time.Duration
+	// Clock 时钟抽象（#78/#152）：LocalBackend 与 Redis 后端的时间判断都走
+	// 本接口，注入假时钟后「到点触发」场景不必真睡即可断言。nil 表示
+	// SystemClock{}（调用方自行兜底）。
+	Clock Clock
 }
 
 // ResolveOptions 解析选项并返回后端配置。
@@ -297,5 +304,6 @@ func ResolveOptions(opts ...TimerTaskOption) BackendConfig {
 		OnFailure:         cfg.onFailure,
 		Delivery:          cfg.delivery,
 		VisibilityTimeout: cfg.visibilityTimeout,
+		Clock:             cfg.clock,
 	}
 }

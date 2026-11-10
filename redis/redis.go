@@ -95,6 +95,11 @@ type RedisBackend struct {
 	delivery          timertask.DeliveryMode
 	visibilityTimeout time.Duration
 
+	// clock 时钟抽象（#152）：到点扫描、租约 deadline、回扫、死信 score 等
+	// 任务时间判断单源；nil 取真实时钟。停机限时（bestEffortRedisTimeout /
+	// requeueShutdownWindow）是真实墙钟约束，**不**走注入时钟。
+	clock timertask.Clock
+
 	// 本地队列：携带原始 ZSet member，可靠模式 Ack 时使用
 	localQueue chan *claim
 	stopChan   chan struct{}
@@ -132,6 +137,7 @@ func NewRedisBackend(buzType string, client goredis.UniversalClient, handler tim
 		retryDelay:        cfg.RetryDelay,
 		delivery:          cfg.Delivery,
 		visibilityTimeout: cfg.VisibilityTimeout,
+		clock:             cfg.Clock,
 		localQueue:        make(chan *claim, 100000),
 		stopChan:          make(chan struct{}),
 	}
@@ -409,7 +415,7 @@ func (b *RedisBackend) consumeRemoteLoop(ctx context.Context) {
 }
 
 func (b *RedisBackend) consumeRemoteOnce(ctx context.Context) {
-	now := time.Now().Unix()
+	now := b.now().Unix() // #152：到点判断走注入时钟
 
 	// 只扫描当前负责的分片
 	shards := b.shardManager.GetMyShards()
@@ -482,9 +488,45 @@ func (b *RedisBackend) workerLoop(ctx context.Context) {
 			if c == nil || c.task == nil {
 				continue
 			}
+			// #151 停机交接点：select 对 ctx.Done / stopChan / localQueue 多路
+			// 同时就绪时随机取分支——「先 close(stopChan) 再回灌」挡不住回灌
+			// 窗口内 worker 抢走 localQueue 里的任务。取到任务后二次确认停机：
+			// 已停机则把 claim 原样回灌 Redis（与 #96 在途 claim 同款处置），
+			// 不拿已取消的 ctx 跑 handler——被抢任务要么执行成功、要么回灌，
+			// 不静默丢弃、不进假死信。
+			if b.interrupted(ctx) {
+				b.requeueClaimOnShutdown(c)
+				return
+			}
 			b.processTask(ctx, c)
 		}
 	}
+}
+
+// interrupted 报告消费是否已被停机打断（ctx 已取消或 stopChan 已关闭）。
+func (b *RedisBackend) interrupted(ctx context.Context) bool {
+	if ctx.Err() != nil {
+		return true
+	}
+	select {
+	case <-b.stopChan:
+		return true
+	default:
+		return false
+	}
+}
+
+// handleInterruptedClaim 处理「执行中被停机打断、尚未到终态」的 claim（#151）：
+// 保证「要么执行成功、要么回到可追踪的位置」，不静默丢弃、不进假死信。
+//
+//   - at-most-once：claim 时已从 ZSet 原子删除，本地是它唯一去处——回灌 Redis；
+//   - at-least-once：租约留在 processing（不 Ack），由回扫按到期时间重投
+//     （ack_interrupt_test 钉住的闭环：中断 ⇒ 租约保留 ⇒ 回扫捡回）。
+func (b *RedisBackend) handleInterruptedClaim(c *claim) {
+	if b.delivery == timertask.DeliveryAtLeastOnce {
+		return
+	}
+	b.requeueClaimOnShutdown(c)
 }
 
 // processTask 处理单个任务，支持重试。可靠模式下成功或终态失败会 Ack 租约。
@@ -552,8 +594,12 @@ func (b *RedisBackend) processTask(ctx context.Context, c *claim) {
 			}
 			select {
 			case <-ctx.Done():
+				// #151：中断不裸 return——任务必须回到可追踪的位置，
+				// 否则 at-most-once 的已 claim 任务三处皆无、永久丢失。
+				b.handleInterruptedClaim(c)
 				return
 			case <-b.stopChan:
+				b.handleInterruptedClaim(c)
 				return
 			case <-retryTimer.C:
 			}
@@ -571,6 +617,13 @@ func (b *RedisBackend) processTask(ctx context.Context, c *claim) {
 			return
 		}
 		log.Error("handler error", "taskID", task.ID, "err", err)
+		// #151：停机打断导致的失败不算真失败——已取消的 ctx 下 handler 必然
+		// 立刻失败，继续重试只会耗尽次数把「从未真正处理」的任务写进死信
+		// （假死信）。打断态直接收尾，任务回到可追踪的位置。
+		if b.interrupted(ctx) {
+			b.handleInterruptedClaim(c)
+			return
+		}
 	}
 
 	// 重试次数用完：先写入持久死信（best-effort），再触发进程内回调
@@ -599,7 +652,7 @@ func (b *RedisBackend) sendToDeadLetter(task *timertask.Task) {
 		key := fmt.Sprintf(deadLetterKey, b.buzType)
 		pipe := b.client.Pipeline()
 		pipe.ZAdd(ctx, key, goredis.Z{
-			Score:  float64(time.Now().Unix()),
+			Score:  float64(b.now().Unix()), // #152：死信 score 走注入时钟
 			Member: string(data),
 		})
 		// 按失败时间只保留最近 deadLetterMaxLen 条
@@ -651,6 +704,16 @@ func bestEffortRedisTimeout(op string, timeout time.Duration, fn func(ctx contex
 		log.Warn("best-effort redis write timed out, abandoned", "op", op, "timeout", timeout)
 		return ctx.Err()
 	}
+}
+
+// now 返回注入时钟的当前时间（#152）：WithClock 对 RedisBackend 生效，
+// 任务时间判断（到点扫描、租约 deadline、回扫、死信 score）单源走这里。
+// nil 取真实时钟（结构体字面量构造的测试路径兜底）。
+func (b *RedisBackend) now() time.Time {
+	if b.clock == nil {
+		return time.Now()
+	}
+	return b.clock.Now()
 }
 
 // parseTask 解析任务数据。

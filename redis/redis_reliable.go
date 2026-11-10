@@ -124,7 +124,7 @@ func (b *RedisBackend) renewLoop(ctx context.Context, member string, stop <-chan
 				return b.client.ZAddArgs(callCtx, b.processingKey(), goredis.ZAddArgs{
 					XX: true,
 					Members: []goredis.Z{{
-						Score:  float64(b.leaseDeadline(time.Now().Unix())),
+						Score:  float64(b.leaseDeadline(b.now().Unix())), // #152
 						Member: member,
 					}},
 				}).Err()
@@ -140,7 +140,7 @@ func (b *RedisBackend) renewLoop(ctx context.Context, member string, stop <-chan
 // reapExpiredLeases 把租约到期的任务按 RetryCount 重投回分片 ZSet。
 // 崩溃前未 Ack 的任务由本回扫捡回，实现 at-least-once（可容忍重复，调用方幂等）。
 func (b *RedisBackend) reapExpiredLeases(ctx context.Context) {
-	now := time.Now().Unix()
+	now := b.now().Unix() // #152：过期判定走注入时钟
 	pkey := b.processingKey()
 	members, err := b.client.ZRangeByScore(ctx, pkey, &goredis.ZRangeBy{
 		Min:    "0",
@@ -185,11 +185,14 @@ func (b *RedisBackend) reapExpiredLeases(ctx context.Context) {
 			continue
 		}
 		key := b.taskKey(task.ID)
-		// 先摘租约再回投，失败则任务丢失——用 pipeline 降低窗口；
-		// 回投失败会记日志，仍优于静默。
+		// 先回投、后摘租约（#150，与 requeueClaim 同款顺序）：pipeline 非
+		// MULTI/EXEC，中途瞬时错误时按此顺序失败退化为「重复投递」（任务
+		// 同时留在分片 ZSet 与 processing，回扫下轮再摘），而不是旧顺序
+		// 「先摘租约再回投」的「哪都不在 = 永久丢失」——at-least-once 允许
+		// 重复、不允许丢失。
 		pipe := b.client.Pipeline()
-		pipe.ZRem(ctx, pkey, member)
 		pipe.ZAdd(ctx, key, goredis.Z{Score: float64(task.EndTime), Member: string(data)})
+		pipe.ZRem(ctx, pkey, member)
 		if _, err := pipe.Exec(ctx); err != nil {
 			log.Error("reap requeue failed", "taskID", task.ID, "err", err)
 			continue
