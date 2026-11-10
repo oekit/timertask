@@ -2,6 +2,12 @@
 
 由 ekit v0.34.0（git.enjoye.top/enjoydream/ekit，冻结维护）拆分而来。所有 notable 变更记录如下。
 
+## [Unreleased]
+
+- fix(redis): reapExpiredLeases 重投反转为「先回投、后摘租约」——重投窗口内瞬时错误退化为重复投递而非任务永久丢失（#150）
+
+关联问题单：oekit/timertask#150。
+
 ## [v0.3.2] — 2026-11-10
 
 - - build: 依赖地板对齐（floor sync，无代码变更）
