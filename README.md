@@ -8,9 +8,9 @@
 ## 安装
 
 ```bash
-go get github.com/oekit/timertask@v0.3.0
+go get github.com/oekit/timertask@v0.3.3
 # 需要 Redis 形态（嵌套模块，按需引入）：
-go get github.com/oekit/timertask/redis@v0.2.17
+go get github.com/oekit/timertask/redis@v0.2.18
 ```
 
 ## 这个仓库做什么
@@ -61,7 +61,7 @@ _ = sched.Start(ctx)
 `redis/v0.2.0`），不是根包下的子目录——所以迁移要改**两处**：
 
 ```bash
-go get github.com/oekit/timertask/redis@v0.2.17   # ① go.mod 新增 require（必需）
+go get github.com/oekit/timertask/redis@v0.2.18   # ① go.mod 新增 require（必需）
 ```
 
 ```go
