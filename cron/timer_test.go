@@ -65,13 +65,15 @@ func TestStartReconcile_StopsTimerOnExit(t *testing.T) {
 	if err := s.Close(closeCtx); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	if cc.stops.Load() < 1 {
-		t.Fatalf("退出路径未 Stop 周期 timer（#174）: stops=%d", cc.stops.Load())
-	}
+	// Close 不等待 StartReconcile goroutine 自身——先等它返回（stopCh 分支
+	// 已执行 timer.Stop），再断言 stops，否则与 goroutine 调度竞态。
 	select {
 	case <-errCh:
 	case <-time.After(2 * time.Second):
 		t.Fatal("Close 后 StartReconcile 未返回")
+	}
+	if cc.stops.Load() < 1 {
+		t.Fatalf("退出路径未 Stop 周期 timer（#174）: stops=%d", cc.stops.Load())
 	}
 }
 
