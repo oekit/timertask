@@ -2,6 +2,12 @@
 
 由 oekit/timertask v0.2.0 拆分而来（Redis 形态独立成模块）。
 
+## [v0.2.20] — 2026-11-12
+
+- 跟随 timertask v0.5.0 发版（release_train 嵌套 train）（timertask#167、timertask#168、timertask#169、timertask#170、timertask#171、timertask#172、timertask#173、timertask#174、timertask#175、timertask#176）
+
+关联问题单：timertask#167、timertask#168、timertask#169、timertask#170、timertask#171、timertask#172、timertask#173、timertask#174、timertask#175、timertask#176。
+
 ## [v0.2.19] — 2026-11-11
 
 - fix(redis): 租约回投收敛为 Lua 原子脚本 requeueLeaseScript——「先回投成功再摘租约」由服务端保证，回投写命令级失败（OOM / maxmemory 逐出 / WRONGTYPE）不再把任务从分片 ZSet 与 processing 两边一起摘掉、不进死信（#157）。go-redis Pipeline() 非 MULTI/EXEC、逐条独立执行，#150 的命令顺序反转（先 ZAdd 后 ZRem）堵不住「ZAdd 失败 + ZRem 成功」的半失败腿；脚本内 redis.call 出错即中止（后续命令不执行）：ZAdd 失败 ⇒ ZRem 不执行、租约保留、下轮回扫再投；ZAdd 成功后 ZRem 失败 ⇒ 任务暂留两处、下轮回扫重复回投——两腿都退化为「重复」而非「丢失」，at-least-once 允许重复、不容忍丢失。reapExpiredLeases 与 requeueClaim 两条回投路径统一走该脚本（issue 关切的「同一操作两种顺序」收敛为同一原子面）。
