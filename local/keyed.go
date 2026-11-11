@@ -69,7 +69,7 @@ func (s *Scheduler) ScheduleFor(key, spec string, fn Task) error {
 	s.mu.Lock()
 	if s.stopped {
 		s.mu.Unlock()
-		return errors.New("local: scheduler stopped")
+		return ErrSchedulerStopped
 	}
 	old := s.keyed[key]
 	if old != nil && old.spec == spec {
@@ -84,7 +84,7 @@ func (s *Scheduler) ScheduleFor(key, spec string, fn Task) error {
 	// 一并拒掉，与 Reconcile「spec 未变时 Task 被忽略」口径分裂。
 	if fn == nil {
 		s.mu.Unlock()
-		return errors.New("local: nil task")
+		return ErrNilTask
 	}
 	if old != nil {
 		delete(s.keyed, key)
@@ -182,7 +182,7 @@ func (s *Scheduler) Reconcile(entries []Entry) error {
 			continue
 		}
 		if en.Task == nil {
-			errs = append(errs, fmt.Errorf("local: reconcile %q: nil task", en.Key))
+			errs = append(errs, fmt.Errorf("local: reconcile %q: %w", en.Key, ErrNilTask))
 			continue
 		}
 		sched, err := s.parseSpec(en.Spec)
@@ -201,7 +201,7 @@ func (s *Scheduler) Reconcile(entries []Entry) error {
 	s.mu.Lock()
 	if s.stopped {
 		s.mu.Unlock()
-		errs = append(errs, errors.New("local: scheduler stopped"))
+		errs = append(errs, ErrSchedulerStopped)
 		return errors.Join(errs...)
 	}
 	started := s.started

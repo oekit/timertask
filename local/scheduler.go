@@ -17,6 +17,20 @@ import (
 // ErrDuplicateSpec 表示同一个 cron 表达式被重复注册。
 var ErrDuplicateSpec = errors.New("local: cron spec already scheduled")
 
+// ErrSchedulerStopped 表示调度器已停机（Stop 已调用或 Start 已返回），实例
+// 进入终态。
+//
+// 实例一次性（对齐根包 ErrBackendStopped / cron.ErrSchedulerStopped 的纪律，
+// #177）：停机后 Schedule/ScheduleFor/Reconcile 直返本错误（Reconcile 经
+// errors.Join 逐条汇总），不静默哑火。此前四处 errors.New 现造同串错误，
+// 调用方无法 errors.Is 判定「实例已停机」，cron.Scheduler 经 ScheduleFor
+// 透传的也是不可判定的裸错误。
+var ErrSchedulerStopped = errors.New("local: scheduler stopped")
+
+// ErrNilTask 表示注册的任务函数为 nil（Schedule/ScheduleFor/Reconcile）。
+// 此前各处 errors.New 现造同串错误（#177），调用方无法 errors.Is 判定。
+var ErrNilTask = errors.New("local: nil task")
+
 // ErrUnsatisfiableSpec 表示 cron 表达式语法合法但**永无触发点**（#123），
 // 例如 `0 0 31 2 *`（2 月永无 31 日）。
 //
@@ -170,7 +184,7 @@ func New(cfg Config) (*Scheduler, error) {
 // 求不出（Next 返回零值）即报错，与调度循环实际的消费口径一致。
 func (s *Scheduler) Schedule(spec string, fn Task) error {
 	if fn == nil {
-		return errors.New("local: nil task")
+		return ErrNilTask
 	}
 	sched, err := s.parseSpec(spec)
 	if err != nil {
@@ -185,7 +199,7 @@ func (s *Scheduler) Schedule(spec string, fn Task) error {
 	s.mu.Lock()
 	if s.stopped {
 		s.mu.Unlock()
-		return errors.New("local: scheduler stopped")
+		return ErrSchedulerStopped
 	}
 	if _, ok := s.entries[spec]; ok {
 		s.mu.Unlock()
@@ -247,7 +261,7 @@ func (s *Scheduler) Start(ctx context.Context) error {
 	}
 	if s.stopped {
 		s.mu.Unlock()
-		return errors.New("local: scheduler stopped")
+		return ErrSchedulerStopped
 	}
 	s.started = true
 	s.taskCtx = ctx
