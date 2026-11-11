@@ -179,8 +179,8 @@ func TestRedisBackend_Remove_LegacyMember(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := client.ZAdd(ctx, b.taskKey("legacy-1"), goredis.Z{Score: float64(fire), Member: string(legacy)}).Result(); err != nil {
-		t.Fatal(err)
+	if _, zerr := client.ZAdd(ctx, b.taskKey("legacy-1"), goredis.Z{Score: float64(fire), Member: string(legacy)}).Result(); zerr != nil {
+		t.Fatal(zerr)
 	}
 
 	removed, err := b.Remove(ctx, "legacy-1", fire)

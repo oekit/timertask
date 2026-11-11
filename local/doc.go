@@ -8,8 +8,9 @@
 //
 // # 与根包的关系
 //
-// 本包是 github.com/oekit/timertask 的子包（同模块），但不 import 根包：
-// 两者互不依赖（根包也不依赖本包），各自独立演进。需要「延迟队列」
+// 本包是 github.com/oekit/timertask 的子包（同模块），import 根包仅限
+// Clock 别名归一（#78，clock.go 嵌入根包定义——单一事实源）与模块内
+// 单源 internal/gosafe（#168）；根包不 import 本包。需要「延迟队列」
 // （投递到未来某时刻）而不是「cron 触发」时，用根包的 LocalBackend。
 //
 // # 语义（明确约定）

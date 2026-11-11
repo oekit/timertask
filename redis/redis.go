@@ -263,8 +263,8 @@ func (b *RedisBackend) Start(ctx context.Context) error {
 	}
 	if b.started {
 		b.mu.Unlock()
-		// 与根包 errBackendAlreadyStarted 同串（独立 module 无法访问未导出符号）。
-		return errors.New("timertask: backend already started")
+		// already-started 哨兵单源（#169）：根包导出的 timertask.ErrBackendAlreadyStarted。
+		return timertask.ErrBackendAlreadyStarted
 	}
 	b.started = true
 	b.mu.Unlock()
@@ -460,7 +460,18 @@ func (b *RedisBackend) consumeRemoteOnce(ctx context.Context) {
 			if ok {
 				task := b.parseTask(data)
 				if task == nil {
-					log.Error("failed to parse task from ZSet, data discarded", "key", key)
+					// #175：毒丸 member 不能静默丢弃——claim 已原子删除
+					// （at-most-once）或移入租约集（at-least-once），直接丢
+					// 弃 = 任务三处皆无、无取证痕迹，绕过专为止损取证设计的
+					// 死信 ZSet。原样写死信（best-effort，与 sendToDeadLetter
+					// 同纪律）。
+					b.sendToDeadLetterRaw(data)
+					if b.delivery == timertask.DeliveryAtLeastOnce {
+						// 租约集里的毒丸不会有真执行，摘租约止损——不摘会被
+						// 回扫再次判脏，死信出现重复条目。
+						b.ackTask(ctx, data)
+					}
+					log.Error("failed to parse task from ZSet, raw member sent to dead letter", "key", key)
 					continue
 				}
 				// 推入本地队列
@@ -536,11 +547,12 @@ func (b *RedisBackend) handleInterruptedClaim(c *claim) {
 	b.requeueClaimOnShutdown(c)
 }
 
-// processTask 处理单个任务，支持重试。可靠模式下成功或终态失败会 Ack 租约。
+// processTask 处理单个任务，支持重试（重试主循环单源 timertask.RunWithRetry，
+// #169：与 local 后端平级复制的骨架收敛到根包；redis 的差异——失败后判打断
+// 态、中断时 handleInterruptedClaim——全部留在 RetryHooks 钩子里）。可靠模式
+// 下成功或终态失败会 Ack 租约。
 func (b *RedisBackend) processTask(ctx context.Context, c *claim) {
 	task := c.task
-	var err error
-	normalizeRetry(task)
 	// terminal 标记「本次处理已到终态」（成功 / 已进死信）——只有终态才 Ack 租约。
 	//
 	// 此前 defer 里的 Ack 在**每条**返回路径上都执行，包括「重试窗口内被
@@ -584,63 +596,39 @@ func (b *RedisBackend) processTask(ctx context.Context, c *claim) {
 			<-renewExited
 		}()
 	}
-	// retryTimer lazy init: i=0 直接调 handler，不需要 timer；只有真正进入重试路径
-	// 才创建 timer，避免每次成功任务都起一个未消费的 timer（defer Stop 不会释放
-	// 已经被 runtime 调度过但未读取的 tick，长时间运行会累积）。
-	// defer 在 if 块里只触发 1 次，gocritic deferInLoop 是误报。
-	var retryTimer *time.Timer
-	for i := 0; i <= task.MaxRetry; i++ {
-		if i > 0 {
-			// 重试延迟
-			if retryTimer == nil {
-				retryTimer = time.NewTimer(b.retryDelay)
-				//nolint:gocritic // lazy init：仅首次进入重试路径时分配，defer 与 NewTimer 配对
-				defer retryTimer.Stop()
-			} else {
-				retryTimer.Reset(b.retryDelay)
-			}
-			select {
-			case <-ctx.Done():
-				// #151：中断不裸 return——任务必须回到可追踪的位置，
-				// 否则 at-most-once 的已 claim 任务三处皆无、永久丢失。
-				b.handleInterruptedClaim(c)
-				return
-			case <-b.stopChan:
-				b.handleInterruptedClaim(c)
-				return
-			case <-retryTimer.C:
-			}
-			task.RetryCount = i
-			log.Warn("retrying task", "taskID", task.ID, "attempt", i, "maxRetry", task.MaxRetry)
-		}
-
-		// handler panic 就地收编为任务失败：panic 穿透 workerLoop 会打死该 worker
-		// goroutine（async.GoSafe 的 recover 在出口、不重启），N 个 panic 任务耗尽
-		// worker 池后消费瘫痪，且任务已从 ZSet claim、不会进死信 ZSet——永久丢失。
-		// 收编后走既有重试 + sendToDeadLetter 路径。
-		err = runHandlerSafe(ctx, b.handler, task)
-		if err == nil {
-			terminal = true
-			return
-		}
-		log.Error("handler error", "taskID", task.ID, "err", err)
+	outcome, err := timertask.RunWithRetry(ctx, task, b.handler, b.retryDelay, b.stopChan, timertask.RetryHooks{
 		// #151：停机打断导致的失败不算真失败——已取消的 ctx 下 handler 必然
 		// 立刻失败，继续重试只会耗尽次数把「从未真正处理」的任务写进死信
 		// （假死信）。打断态直接收尾，任务回到可追踪的位置。
-		if b.interrupted(ctx) {
+		Interrupted: func() bool { return b.interrupted(ctx) },
+		OnInterrupted: func() {
+			// 中断不裸 return——任务必须回到可追踪的位置，否则 at-most-once
+			// 的已 claim 任务三处皆无、永久丢失。
 			b.handleInterruptedClaim(c)
-			return
+		},
+		OnRetry: func(attempt, maxRetry int) {
+			log.Warn("retrying task", "taskID", task.ID, "attempt", attempt, "maxRetry", maxRetry)
+		},
+		OnError: func(err error) {
+			log.Error("handler error", "taskID", task.ID, "err", err)
+		},
+	})
+	switch outcome {
+	case timertask.RetrySuccess:
+		terminal = true
+	case timertask.RetryInterrupted:
+		// 中断处置已由 OnInterrupted 钩子完成；不 Ack，租约由回扫兜底。
+		return
+	case timertask.RetryExhausted:
+		// 重试次数用完：先写入持久死信（best-effort），再触发进程内回调
+		log.Error("task failed after retries", "taskID", task.ID, "maxRetry", task.MaxRetry, "err", err)
+		b.sendToDeadLetter(task)
+		if b.onFailure != nil {
+			b.onFailure(task, err)
 		}
+		// 终态（已进死信）：租约可以释放。
+		terminal = true
 	}
-
-	// 重试次数用完：先写入持久死信（best-effort），再触发进程内回调
-	log.Error("task failed after retries", "taskID", task.ID, "maxRetry", task.MaxRetry, "err", err)
-	b.sendToDeadLetter(task)
-	if b.onFailure != nil {
-		b.onFailure(task, err)
-	}
-	// 终态（已进死信）：租约可以释放。
-	terminal = true
 }
 
 // sendToDeadLetter 将重试耗尽的任务写入持久死信 ZSet（score 为失败时间戳），
@@ -652,15 +640,29 @@ func (b *RedisBackend) sendToDeadLetter(task *timertask.Task) {
 		log.Error("dead letter marshal failed", "taskID", task.ID, "err", err)
 		return
 	}
-	// 死信写入带限时：它在**失败收尾路径**上，若 Redis 是黑洞
-	// （网络分区而非拒连），无界的写会把 worker goroutine 挂住 ⇒
-	// worker 池被拖垮、优雅停机卡住。超窗后按 best-effort 语义放弃。
-	bestEffortRedis("dead_letter", func(ctx context.Context) error {
+	b.deadLetterWrite("dead_letter", string(data))
+}
+
+// sendToDeadLetterRaw 把无法解析的毒丸 member 原样写入死信 ZSet（#175）：
+// score 取当前时刻（注入时钟），member 保持原始字节——毒丸的本义就是
+// 「按任务 JSON 解析不了」，取证需要原始数据，不做二次包装。best-effort，
+// 与 sendToDeadLetter 同纪律。
+func (b *RedisBackend) sendToDeadLetterRaw(member string) {
+	b.deadLetterWrite("dead_letter_poison", member)
+}
+
+// deadLetterWrite 是死信 ZSet 的唯一写入面（重试耗尽与毒丸两条路径共用）：
+// 带限时 best-effort——死信写在**失败收尾路径**上，若 Redis 是黑洞
+// （网络分区而非拒连），无界的写会把 worker goroutine 挂住 ⇒ worker 池被
+// 拖垮、优雅停机卡住。超窗后按 best-effort 语义放弃；按 score 只保留最近
+// deadLetterMaxLen 条。
+func (b *RedisBackend) deadLetterWrite(op, member string) {
+	bestEffortRedis(op, func(ctx context.Context) error {
 		key := fmt.Sprintf(deadLetterKey, b.buzType)
 		pipe := b.client.Pipeline()
 		pipe.ZAdd(ctx, key, goredis.Z{
 			Score:  float64(b.now().Unix()), // #152：死信 score 走注入时钟
-			Member: string(data),
+			Member: member,
 		})
 		// 按失败时间只保留最近 deadLetterMaxLen 条
 		pipe.ZRemRangeByRank(ctx, key, 0, -deadLetterMaxLen-1)

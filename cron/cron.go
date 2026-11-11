@@ -10,6 +10,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	pkgerrors "github.com/oekit/pkg/errors"
+
+	"github.com/oekit/timertask/internal/gosafe"
 	"github.com/oekit/timertask/local"
 )
 
@@ -215,7 +218,7 @@ func New(exec Executor, opts ...CronOption) *Scheduler {
 	s.engineCtx, s.engineCancel = context.WithCancel(context.Background())
 	s.startEngineOnce = sync.OnceFunc(func() {
 		s.engineStarted.Store(true)
-		goSafe(func() {
+		gosafe.Go(func() {
 			defer close(s.engineDone)
 			// Start 返回值按 local.Start 语义（#99）：停机正常路径也带
 			// ctx.Err()——只对意外错误留痕。
@@ -342,8 +345,8 @@ func (s *Scheduler) Remove(_ context.Context, id string) bool {
 //  3. ctx 取消 ⇒ 停机（触发引擎同停）返回 ctx.Err()；Close 触发的正常
 //     停机返回 nil。
 //
-// 周期等待走注入时钟（clock.After）——FakeClock 测试下对账节奏确定性
-// 可控，不真睡。自带循环的调用方直接周期调 Reconcile 即可。
+// 周期等待走注入时钟（clock.NewTimer 可停 timer，#174）——FakeClock 测试下
+// 对账节奏确定性可控，不真睡。自带循环的调用方直接周期调 Reconcile 即可。
 func (s *Scheduler) StartReconcile(ctx context.Context, interval time.Duration, listFn func() ([]Plan, error)) error {
 	if interval <= 0 {
 		return errors.New("cron: StartReconcile: interval must be > 0")
@@ -370,14 +373,19 @@ func (s *Scheduler) StartReconcile(ctx context.Context, interval time.Duration, 
 
 	for {
 		s.reconcileOnce(ctx, listFn)
-		ch := s.cfg.clock.After(interval)
+		// #174：可停 timer——旧实现 clock.After 每轮新建不可停 timer，ctx
+		// 取消 / Close 退出时遗弃一个挂满整个 interval 的 timer；醒来/退出
+		// 即 Stop。
+		timer := s.cfg.clock.NewTimer(interval)
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			s.stopOnce()
 			return ctx.Err()
 		case <-s.stopCh:
+			timer.Stop()
 			return nil // Close 触发的正常停机（#99 同口径）
-		case <-ch:
+		case <-timer.C():
 		}
 	}
 }
@@ -531,11 +539,12 @@ func (s *Scheduler) fire(ctx context.Context, planID string, at time.Time) error
 }
 
 // execSafe 调用执行函数并把 panic 收编为错误（panic 不得打死触发引擎，
-// 且收编结果照常进台账——根包 runHandlerSafe 同款纪律）。
+// 且收编结果照常进台账——根包 runHandlerSafe 同款纪律）。panic 收编单源
+// （pkg errors.Recovered，#171）：身份与栈由 PanicError 携带。
 func (s *Scheduler) execSafe(ctx context.Context, planID, trigger string) (err error) {
 	defer func() {
-		if r := recover(); r != nil {
-			err = fmt.Errorf("cron: executor panic: %v", r)
+		if perr := pkgerrors.Recovered(recover()); perr != nil {
+			err = fmt.Errorf("cron: executor panic: %w", perr)
 		}
 	}()
 	return s.exec(ctx, planID, trigger)
@@ -556,11 +565,12 @@ func (s *Scheduler) recordSkip(ctx context.Context, planID, trigger string, caus
 }
 
 // record 落运行台账（内置 MemLedger + 外置 Ledger 并联），panic 收编——
-// 台账故障不得打死触发。
+// 台账故障不得打死触发。panic 收编单源（pkg errors.Recovered，#171）：
+// 台账 panic 的类型/身份/栈由 PanicError 携带。
 func (s *Scheduler) record(ctx context.Context, rec RunRecord) {
 	defer func() {
-		if r := recover(); r != nil {
-			s.log.Error("run ledger panic recovered", "panic", r)
+		if perr := pkgerrors.Recovered(recover()); perr != nil {
+			s.log.Error("run ledger panic recovered", "panic", perr)
 		}
 	}()
 	s.mem.Record(ctx, rec)

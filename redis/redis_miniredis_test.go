@@ -2,6 +2,7 @@ package redis
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -33,6 +34,16 @@ func newTestRedisBackend(t *testing.T) (*RedisBackend, *miniredis.Miniredis) {
 		stopChan:     make(chan struct{}),
 		shardManager: NewShardManager("test", c, cfg.Buckets),
 	}, mr
+}
+
+// mustJSON 序列化 task（测试辅助，#172：此前声明在生产文件 redis_reliable.go
+// 里、生产代码零引用，现挪进测试文件）。
+func mustJSON(t *timertask.Task) string {
+	data, err := json.Marshal(t)
+	if err != nil {
+		panic(err)
+	}
+	return string(data)
 }
 
 func TestRedisBackend_Send(t *testing.T) {

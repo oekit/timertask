@@ -172,13 +172,19 @@ func (b *RedisBackend) reapExpiredLeases(ctx context.Context) {
 	for _, member := range members {
 		task := b.parseTask(member)
 		if task == nil {
-			// 脏数据：直接摘掉租约，避免反复回扫
+			// #175：毒丸租约不能静默丢弃——此前直接摘租约，绕过专为止损
+			// 取证设计的死信 ZSet。原样进死信（score=当前时刻），再摘租约
+			// 止损避免反复回扫。顺序先死信后摘租约：半失败时最坏是死信
+			// 重复条目，不会丢取证材料（与 requeueLeaseScript 的
+			// 「先回投再摘」同一取舍）。
+			b.sendToDeadLetterRaw(member)
 			b.ackTask(ctx, member)
 			continue
 		}
 		// 负数 MaxRetry 表示「不重试」，与 worker 侧 processTask 的归一口径
-		// 一致（否则同一份任务在两条路径上的重试语义会分叉）。
-		normalizeRetry(task)
+		// 一致（否则同一份任务在两条路径上的重试语义会分叉）。归一单源
+		// （#169）：根包导出的 timertask.NormalizeRetry。
+		timertask.NormalizeRetry(task)
 		task.RetryCount++
 		// 判定「重试次数耗尽」**不能**再加 `task.MaxRetry > 0` 的守卫：
 		// MaxRetry<=0 时该守卫会让本分支永远不可达 ⇒ 租约到期后任务被无限
@@ -247,13 +253,4 @@ func (b *RedisBackend) reapLoop(ctx context.Context) {
 			b.reapExpiredLeases(ctx)
 		}
 	}
-}
-
-// mustJSON 序列化 task（测试辅助）。
-func mustJSON(t *timertask.Task) string {
-	data, err := json.Marshal(t)
-	if err != nil {
-		panic(err)
-	}
-	return string(data)
 }
