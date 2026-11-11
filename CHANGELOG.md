@@ -1,3 +1,27 @@
+## [redis/v0.2.20] — 2026-11-12
+
+- refactor(local,cron): 全仓重构收敛——Scheduler「entries+keyed 双表快照」四处收集块收敛为 snapshotEntries()（#167）；goSafe 同模块三份拷贝（logging.go/local/cron）收敛到 internal/gosafe 单源、日志统一补 stack 字段、修正 local「刻意不 import 根包」失实注释（#168）；cron spec「解析+时区+可满足性」三连抄收敛为 parseSpec/checkSatisfiable（三处错误文案逐字不变，#170）；mustJSON 测试辅助从生产文件挪进 _test.go（#172）
+- refactor: local 与 redis 两后端 processTask 重试主循环收敛为根包导出的 RunWithRetry（lazy 重试 timer + 退避 select + panic 收编 + RetryCount 推进单点实现），后端差异留 RetryHooks 钩子（local 中断丢弃 / redis handleInterruptedClaim）；NormalizeRetry、ErrBackendAlreadyStarted 一并导出，redis 嵌套模块删除被迫自持的 helpers 复制（#169）
+- fix: 「recover→error」收编助手四份形态（runHandlerSafe / local.Scheduler.invoke / cron.Scheduler.execSafe / cron.Scheduler.record）统一走 pkg errors.Recovered 单源（#171）；runHandlerSafe panic 收编从 fmt.Errorf(%v) 改走 errors.Recovered——panic 值是 error 时身份透传（errors.Is/As 可判定原始错误，此前重试判定/死信归因断链）、goroutine 栈恒在场（#173，附回归测试）
+- fix(local,cron): 对账循环 clock.After 每轮新建不可停 timer、被 wake/停机打断时遗弃堆积（堆积量=打断频率×剩余等待）→ local.Clock 接口新增 NewTimer 可停 timer 形态（SystemClock/FakeClock 同步实现），scheduler.run 与 cron.StartReconcile 醒来/退出即 Stop（#174，附回归测试）
+- fix(redis): 毒丸 member 静默丢弃 → 原样写入死信 ZSet 取证（claim 与租约回扫两路径，score 取当前时刻），at-least-once 下补摘租约止损（随嵌套 redis/v0.2.20 发布，#175，附 miniredis 毒丸专项测试×3）
+- fix: WithRetry 构造期校验——负 count/负 delay 直接 panic（对齐同簇「配置错误启动即暴露」纪律；此前负 count 被下游 normalizeRetry 隐式归 0 静默变义、负 delay 变忙重试；0 值合法）（#176，附回归测试）
+- chore: Go 地板 1.24.0 → 1.26.0（根与 ci.yml/lint 配置；嵌套 redis 已就位）；pkg 依赖 v0.44.0 → v0.45.0（panic 收编单源 errors.Recovered）。**BREAKING**：local.Clock 接口新增 NewTimer(d time.Duration) Timer 方法——外部自定义 Clock 实现需补该方法（0.x minor 允许 breaking）
+
+关联问题单：timertask#167、timertask#168、timertask#169、timertask#170、timertask#171、timertask#172、timertask#173、timertask#174、timertask#175、timertask#176。
+
+## [v0.5.0] — 2026-11-12
+
+- refactor(local,cron): 全仓重构收敛——Scheduler「entries+keyed 双表快照」四处收集块收敛为 snapshotEntries()（#167）；goSafe 同模块三份拷贝（logging.go/local/cron）收敛到 internal/gosafe 单源、日志统一补 stack 字段、修正 local「刻意不 import 根包」失实注释（#168）；cron spec「解析+时区+可满足性」三连抄收敛为 parseSpec/checkSatisfiable（三处错误文案逐字不变，#170）；mustJSON 测试辅助从生产文件挪进 _test.go（#172）
+- refactor: local 与 redis 两后端 processTask 重试主循环收敛为根包导出的 RunWithRetry（lazy 重试 timer + 退避 select + panic 收编 + RetryCount 推进单点实现），后端差异留 RetryHooks 钩子（local 中断丢弃 / redis handleInterruptedClaim）；NormalizeRetry、ErrBackendAlreadyStarted 一并导出，redis 嵌套模块删除被迫自持的 helpers 复制（#169）
+- fix: 「recover→error」收编助手四份形态（runHandlerSafe / local.Scheduler.invoke / cron.Scheduler.execSafe / cron.Scheduler.record）统一走 pkg errors.Recovered 单源（#171）；runHandlerSafe panic 收编从 fmt.Errorf(%v) 改走 errors.Recovered——panic 值是 error 时身份透传（errors.Is/As 可判定原始错误，此前重试判定/死信归因断链）、goroutine 栈恒在场（#173，附回归测试）
+- fix(local,cron): 对账循环 clock.After 每轮新建不可停 timer、被 wake/停机打断时遗弃堆积（堆积量=打断频率×剩余等待）→ local.Clock 接口新增 NewTimer 可停 timer 形态（SystemClock/FakeClock 同步实现），scheduler.run 与 cron.StartReconcile 醒来/退出即 Stop（#174，附回归测试）
+- fix(redis): 毒丸 member 静默丢弃 → 原样写入死信 ZSet 取证（claim 与租约回扫两路径，score 取当前时刻），at-least-once 下补摘租约止损（随嵌套 redis/v0.2.20 发布，#175，附 miniredis 毒丸专项测试×3）
+- fix: WithRetry 构造期校验——负 count/负 delay 直接 panic（对齐同簇「配置错误启动即暴露」纪律；此前负 count 被下游 normalizeRetry 隐式归 0 静默变义、负 delay 变忙重试；0 值合法）（#176，附回归测试）
+- chore: Go 地板 1.24.0 → 1.26.0（根与 ci.yml/lint 配置；嵌套 redis 已就位）；pkg 依赖 v0.44.0 → v0.45.0（panic 收编单源 errors.Recovered）。**BREAKING**：local.Clock 接口新增 NewTimer(d time.Duration) Timer 方法——外部自定义 Clock 实现需补该方法（0.x minor 允许 breaking）
+
+关联问题单：timertask#167、timertask#168、timertask#169、timertask#170、timertask#171、timertask#172、timertask#173、timertask#174、timertask#175、timertask#176。
+
 ## [v0.4.0] — 2026-11-11
 
 - feat(cron): 新增 `timertask/cron` 动态 cron 装配子包（#159）——「多实例动态 cron 装配 + 执行互斥 + 运行台账」三缺口单点收编（下游 3 处各自手搓调度器的公共面）：`Plan{ID,Spec,Fingerprint,Enabled}` 期望集 + `Reconcile` 指纹 diff 增量重装（指纹未变幂等空操作、不重置 @every 触发基准——防周期重装把长间隔任务永不触发；指纹变化摘旧装新）+ `Upsert/Remove` 运行期单条增改删 + `StartReconcile` 启动清扫（`WithStaleSweep`，zeus/task FailStaleRunning「启动清扫+补发事件」同序）与周期对账循环（listFn 失败/单条坏 spec 只记日志不中断，errors.Join 逐条汇总）。触发引擎复用同模块 local.Scheduler 既有基建（表达式解析/catch-up/并发度/假时钟），根模块 require 仍仅 pkg（go.mod 零变更）。
