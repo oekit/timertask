@@ -5,6 +5,8 @@ import (
 	"context"
 	"sync"
 	"time"
+
+	"github.com/oekit/timertask/internal/gosafe"
 )
 
 // localTaskItem 本地任务条目（用于优先队列）。
@@ -184,17 +186,17 @@ func (b *LocalBackend) Start(ctx context.Context) error {
 	}
 	if b.started {
 		b.mu.Unlock()
-		return errBackendAlreadyStarted
+		return ErrBackendAlreadyStarted
 	}
 	b.started = true
 	b.mu.Unlock()
 
 	// 启动扫描器
-	goSafe(func() { b.scanLoop(ctx) })
+	gosafe.Go(func() { b.scanLoop(ctx) })
 
 	// 启动本地 Worker 池
-	for i := 0; i < b.workers; i++ {
-		goSafe(func() { b.workerLoop(ctx) })
+	for range b.workers {
+		gosafe.Go(func() { b.workerLoop(ctx) })
 	}
 
 	<-ctx.Done()
@@ -294,7 +296,9 @@ func (b *LocalBackend) workerLoop(ctx context.Context) {
 	}
 }
 
-// processTask 处理单个任务，支持重试。
+// processTask 处理单个任务，支持重试（重试主循环单源 RunWithRetry，#169：
+// 与 redis 后端平级复制的骨架收敛到根包；local 的差异只有「中断丢弃」，
+// 即 OnInterrupted/Interrupted 钩子取 nil 缺省）。
 func (b *LocalBackend) processTask(ctx context.Context, task *Task) {
 	// #98：处理结束（成功 / 重试耗尽 / 中断返回）释放 ID 占用——此后同 ID
 	// 可重新提交。被中断的任务按 at-most-once 语义丢弃，释放后调用方可重发。
@@ -304,45 +308,24 @@ func (b *LocalBackend) processTask(ctx context.Context, task *Task) {
 		b.mu.Unlock()
 	}()
 
-	var err error
-	normalizeRetry(task)
-	// retryTimer lazy init：见 redis.go 对应注释。
-	// defer 在 if 块里只触发 1 次（nil-check 失败后 retryTimer != nil），
-	// 不会在循环里累积，gocritic 的 deferInLoop 是误报。
-	var retryTimer *time.Timer
-	for i := 0; i <= task.MaxRetry; i++ {
-		if i > 0 {
-			// 重试延迟
-			if retryTimer == nil {
-				retryTimer = time.NewTimer(b.retryDelay)
-				//nolint:gocritic // lazy init：仅首次进入重试路径时分配，defer 与 NewTimer 配对
-				defer retryTimer.Stop()
-			} else {
-				retryTimer.Reset(b.retryDelay)
-			}
-			select {
-			case <-ctx.Done():
-				return
-			case <-b.stopChan:
-				return
-			case <-retryTimer.C:
-			}
-			task.RetryCount = i
-			logger.Warn("retrying task", "taskID", task.ID, "attempt", i, "maxRetry", task.MaxRetry)
+	outcome, err := RunWithRetry(ctx, task, b.handler, b.retryDelay, b.stopChan, RetryHooks{
+		OnRetry: func(attempt, maxRetry int) {
+			logger.Warn("retrying task", "taskID", task.ID, "attempt", attempt, "maxRetry", maxRetry)
+		},
+		OnError: func(err error) {
+			logger.Error("handler error", "taskID", task.ID, "err", err)
+		},
+	})
+	switch outcome {
+	case RetrySuccess, RetryInterrupted:
+		// 成功 / 中断丢弃（at-most-once）。
+		return
+	case RetryExhausted:
+		// 重试次数用完，记录失败
+		logger.Error("task failed after retries", "taskID", task.ID, "maxRetry", task.MaxRetry, "err", err)
+		if b.onFailure != nil {
+			b.onFailure(task, err)
 		}
-
-		// handler panic 就地收编为任务失败，走重试/onFailure 路径（见 runHandlerSafe）
-		err = runHandlerSafe(ctx, b.handler, task)
-		if err == nil {
-			return
-		}
-		logger.Error("handler error", "taskID", task.ID, "err", err)
-	}
-
-	// 重试次数用完，记录失败
-	logger.Error("task failed after retries", "taskID", task.ID, "maxRetry", task.MaxRetry, "err", err)
-	if b.onFailure != nil {
-		b.onFailure(task, err)
 	}
 }
 

@@ -94,7 +94,7 @@ func TestLocalBackend_ConcurrentStart_Rejected(t *testing.T) {
 	}
 
 	err := b.Start(context.Background())
-	if err == nil || errors.Is(err, ErrBackendStopped) || !errors.Is(err, errBackendAlreadyStarted) {
-		t.Fatalf("并发二次 Start = %v, want errBackendAlreadyStarted", err)
+	if err == nil || errors.Is(err, ErrBackendStopped) || !errors.Is(err, ErrBackendAlreadyStarted) {
+		t.Fatalf("并发二次 Start = %v, want ErrBackendAlreadyStarted", err)
 	}
 }

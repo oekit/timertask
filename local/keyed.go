@@ -6,6 +6,8 @@ import (
 	"sync"
 
 	"github.com/oekit/pkg/timex/cron"
+
+	"github.com/oekit/timertask/internal/gosafe"
 )
 
 // Entry 是业务键形态的期望条目（Reconcile 的输入，#129）。
@@ -55,18 +57,13 @@ func (s *Scheduler) ScheduleFor(key, spec string, fn Task) error {
 	if key == "" {
 		return errors.New("local: empty key")
 	}
-	sched, err := cron.Parse(spec)
+	sched, err := s.parseSpec(spec)
 	if err != nil {
 		return fmt.Errorf("local: parse cron %q: %w", spec, err)
 	}
-	if loc := s.cfg.Location; loc != nil {
-		if ss, ok := sched.(*cron.SpecSchedule); ok {
-			ss.Location = loc
-		}
-	}
 	// 与 Schedule 同一口径（#123）：试算首个触发点，求不出即报错。
-	if sched.Next(s.clock.Now()).IsZero() {
-		return fmt.Errorf("%w: %q", ErrUnsatisfiableSpec, spec)
+	if err := s.checkSatisfiable(sched); err != nil {
+		return fmt.Errorf("%w: %q", err, spec)
 	}
 
 	s.mu.Lock()
@@ -111,7 +108,7 @@ func (s *Scheduler) ScheduleFor(key, spec string, fn Task) error {
 		old.close() // 旧 spec 的 runner 退出、未开始的触发丢弃
 	}
 	if started {
-		goSafe(func() { s.runEntry(e) })
+		gosafe.Go(func() { s.runEntry(e) })
 	}
 	s.notify()
 	return nil
@@ -188,18 +185,13 @@ func (s *Scheduler) Reconcile(entries []Entry) error {
 			errs = append(errs, fmt.Errorf("local: reconcile %q: nil task", en.Key))
 			continue
 		}
-		sched, err := cron.Parse(en.Spec)
+		sched, err := s.parseSpec(en.Spec)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("local: reconcile %q: parse cron %q: %w", en.Key, en.Spec, err))
 			continue
 		}
-		if loc := s.cfg.Location; loc != nil {
-			if ss, ok := sched.(*cron.SpecSchedule); ok {
-				ss.Location = loc
-			}
-		}
-		if sched.Next(s.clock.Now()).IsZero() {
-			errs = append(errs, fmt.Errorf("%w: reconcile %q: %q", ErrUnsatisfiableSpec, en.Key, en.Spec))
+		if err := s.checkSatisfiable(sched); err != nil {
+			errs = append(errs, fmt.Errorf("%w: reconcile %q: %q", err, en.Key, en.Spec))
 			continue
 		}
 		installs = append(installs, install{key: en.Key, spec: en.Spec, fn: en.Task, sched: sched})
@@ -255,7 +247,7 @@ func (s *Scheduler) Reconcile(entries []Entry) error {
 	}
 	if started {
 		for _, e := range news {
-			goSafe(func() { s.runEntry(e) })
+			gosafe.Go(func() { s.runEntry(e) })
 		}
 	}
 	if len(news) > 0 || len(vanished) > 0 {

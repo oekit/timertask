@@ -8,7 +8,10 @@ import (
 	"sync"
 	"time"
 
+	pkgerrors "github.com/oekit/pkg/errors"
 	"github.com/oekit/pkg/timex/cron"
+
+	"github.com/oekit/timertask/internal/gosafe"
 )
 
 // ErrDuplicateSpec 表示同一个 cron 表达式被重复注册。
@@ -169,20 +172,14 @@ func (s *Scheduler) Schedule(spec string, fn Task) error {
 	if fn == nil {
 		return errors.New("local: nil task")
 	}
-	sched, err := cron.Parse(spec)
+	sched, err := s.parseSpec(spec)
 	if err != nil {
 		return fmt.Errorf("local: parse cron %q: %w", spec, err)
 	}
-	if loc := s.cfg.Location; loc != nil {
-		if ss, ok := sched.(*cron.SpecSchedule); ok {
-			ss.Location = loc
-		}
-	}
 	// #123：可满足性校验。SpecSchedule.Next 对不可满足表达式静默返回零值，
-	// 调度器消费前必须兜住（见 ErrUnsatisfiableSpec）。试算用注入时钟——
-	// FakeClock 测试下判定点确定可复现。
-	if sched.Next(s.clock.Now()).IsZero() {
-		return fmt.Errorf("%w: %q", ErrUnsatisfiableSpec, spec)
+	// 调度器消费前必须兜住（见 ErrUnsatisfiableSpec）。
+	if err := s.checkSatisfiable(sched); err != nil {
+		return fmt.Errorf("%w: %q", err, spec)
 	}
 
 	s.mu.Lock()
@@ -209,7 +206,7 @@ func (s *Scheduler) Schedule(spec string, fn Task) error {
 	s.mu.Unlock()
 
 	if started {
-		goSafe(func() { s.runEntry(e) })
+		gosafe.Go(func() { s.runEntry(e) })
 	}
 	s.notify()
 	return nil
@@ -254,22 +251,16 @@ func (s *Scheduler) Start(ctx context.Context) error {
 	}
 	s.started = true
 	s.taskCtx = ctx
-	entries := make([]*entry, 0, len(s.entries)+len(s.keyed))
-	for _, e := range s.entries {
-		entries = append(entries, e)
-	}
-	for _, e := range s.keyed {
-		entries = append(entries, e)
-	}
+	entries := s.snapshotEntries()
 	for range entries {
 		s.addRunnerLocked()
 	}
 	s.mu.Unlock()
 
 	for _, e := range entries {
-		goSafe(func() { s.runEntry(e) })
+		gosafe.Go(func() { s.runEntry(e) })
 	}
-	goSafe(func() { s.run(ctx) })
+	gosafe.Go(func() { s.run(ctx) })
 
 	select {
 	case <-ctx.Done():
@@ -305,12 +296,10 @@ func (s *Scheduler) Stop(ctx context.Context) error {
 	}
 }
 
-// shutdown 停止调度（幂等）：关闭停止信号与所有 entry，丢弃未开始的触发。
-func (s *Scheduler) shutdown() {
-	s.stopOnce.Do(func() { close(s.stopCh) })
-
-	s.mu.Lock()
-	s.stopped = true
+// snapshotEntries 返回 entries+keyed 双表快照（#167 单源：#129 引入 keyed
+// 双表后同一段收集逻辑抄了四处，将来加第三种键形态只改这里）。
+// 调用方约定不变：须持有 s.mu。
+func (s *Scheduler) snapshotEntries() []*entry {
 	entries := make([]*entry, 0, len(s.entries)+len(s.keyed))
 	for _, e := range s.entries {
 		entries = append(entries, e)
@@ -318,6 +307,16 @@ func (s *Scheduler) shutdown() {
 	for _, e := range s.keyed {
 		entries = append(entries, e)
 	}
+	return entries
+}
+
+// shutdown 停止调度（幂等）：关闭停止信号与所有 entry，丢弃未开始的触发。
+func (s *Scheduler) shutdown() {
+	s.stopOnce.Do(func() { close(s.stopCh) })
+
+	s.mu.Lock()
+	s.stopped = true
+	entries := s.snapshotEntries()
 	s.entries = make(map[string]*entry)
 	s.keyed = make(map[string]*entry)
 	s.mu.Unlock()
@@ -349,22 +348,28 @@ func (s *Scheduler) run(ctx context.Context) {
 			continue
 		}
 
-		wait := next.Sub(now)
-		if wait < 0 {
-			wait = 0
-		}
-		ch := s.clock.After(wait)
-		// 防时钟在「读取 now → 注册等待」之间推进：重新核对，错过就立即重算。
+		wait := max(next.Sub(now), 0)
+		// #174：可停 timer——旧实现 clock.After 每轮新建不可停 timer，被
+		// wake（注册/注销任务触发重算）或停机打断时旧 timer 全部遗弃在原
+		// 到期点（堆积量 = 打断频率 × 剩余等待，daily cron 场景 wait 可达
+		// 小时级）。醒来/打断即 Stop，不再堆积。
+		timer := s.clock.NewTimer(wait)
+		// 防时钟在「读取 now → 注册等待」之间推进：重新核对，错过就立即重算
+		// （重算前同样先停掉刚注册的 timer）。
 		if !s.clock.Now().Before(next) {
+			timer.Stop()
 			continue
 		}
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return
 		case <-s.stopCh:
+			timer.Stop()
 			return
 		case <-s.wake:
-		case <-ch:
+			timer.Stop()
+		case <-timer.C():
 		}
 	}
 }
@@ -372,13 +377,7 @@ func (s *Scheduler) run(ctx context.Context) {
 // dispatchDue 计算并派发所有已到期的触发点，返回下一个触发点时间（零值表示暂无）。
 func (s *Scheduler) dispatchDue(now time.Time) time.Time {
 	s.mu.Lock()
-	entries := make([]*entry, 0, len(s.entries)+len(s.keyed))
-	for _, e := range s.entries {
-		entries = append(entries, e)
-	}
-	for _, e := range s.keyed {
-		entries = append(entries, e)
-	}
+	entries := s.snapshotEntries()
 	s.mu.Unlock()
 
 	var next time.Time
@@ -443,11 +442,39 @@ func (s *Scheduler) execute(e *entry, at time.Time) {
 	}
 }
 
+// parseSpec 解析 cron spec 并注入调度器时区（#170 单源：此前 Schedule /
+// ScheduleFor / Reconcile 三处连抄「解析 + Location 注入」段）。
+// 返回未包装的解析错误——错误上下文（spec/key）由调用点按各自口径包装。
+func (s *Scheduler) parseSpec(spec string) (cron.Schedule, error) {
+	sched, err := cron.Parse(spec)
+	if err != nil {
+		return nil, err
+	}
+	if loc := s.cfg.Location; loc != nil {
+		if ss, ok := sched.(*cron.SpecSchedule); ok {
+			ss.Location = loc
+		}
+	}
+	return sched, nil
+}
+
+// checkSatisfiable 对解析后的 schedule 做可满足性试算（#123/#170 单源）：
+// 首个触发点求不出（Next 返回零值）即返回 ErrUnsatisfiableSpec，调用点按
+// 各自口径包装 spec/key 上下文。试算用注入时钟——FakeClock 测试下判定点
+// 确定可复现。
+func (s *Scheduler) checkSatisfiable(sched cron.Schedule) error {
+	if sched.Next(s.clock.Now()).IsZero() {
+		return ErrUnsatisfiableSpec
+	}
+	return nil
+}
+
 // invoke 调用任务并把 panic 收编为错误（panic 不得打死 runner goroutine）。
+// panic 收编单源（pkg errors.Recovered，#171）：身份与栈由 PanicError 携带。
 func (s *Scheduler) invoke(ctx context.Context, e *entry, at time.Time) (err error) {
 	defer func() {
-		if r := recover(); r != nil {
-			err = fmt.Errorf("task panic: %v", r)
+		if perr := pkgerrors.Recovered(recover()); perr != nil {
+			err = fmt.Errorf("task panic: %w", perr)
 		}
 	}()
 	return e.task(ctx, at)
@@ -464,13 +491,7 @@ func (s *Scheduler) notify() {
 // pendingCount 返回各 spec 待执行触发点的总数（测试观测用）。
 func (s *Scheduler) pendingCount() int {
 	s.mu.Lock()
-	entries := make([]*entry, 0, len(s.entries)+len(s.keyed))
-	for _, e := range s.entries {
-		entries = append(entries, e)
-	}
-	for _, e := range s.keyed {
-		entries = append(entries, e)
-	}
+	entries := s.snapshotEntries()
 	s.mu.Unlock()
 
 	total := 0

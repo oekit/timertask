@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	pkgerrors "github.com/oekit/pkg/errors"
 )
 
 // 通用默认值。
@@ -65,13 +67,13 @@ var ErrEmptyTaskID = errors.New("timertask: task ID must not be empty")
 // redis.NewRedisBackend）。
 var ErrBackendStopped = errors.New("timertask: backend stopped")
 
-// errBackendAlreadyStarted 表示首个 Start 尚未返回时又调用了 Start（#124 的
+// ErrBackendAlreadyStarted 表示首个 Start 尚未返回时又调用了 Start（#124 的
 // 并发形态）：消费 goroutine 已在运行，重复调用直接报错，避免第二组消费者
 // 在第一段停机时集体哑火而调用方毫无感知。
 //
-// redis 嵌套模块（独立 module）无法访问本符号，自持一份同串实现——与
-// runHandlerSafe 的「同源独立一份」先例一致。
-var errBackendAlreadyStarted = errors.New("timertask: backend already started")
+// 导出面（#169）：redis 嵌套模块（独立 module）此前被迫自持一份同串实现，
+// 单源后调用方对两后端都可用 errors.Is 精确判定「并发重复 Start」。
+var ErrBackendAlreadyStarted = errors.New("timertask: backend already started")
 
 // Handler 是任务处理函数。
 type Handler func(ctx context.Context, task *Task) error
@@ -79,18 +81,27 @@ type Handler func(ctx context.Context, task *Task) error
 // runHandlerSafe 就地收编 handler panic 为任务失败：async.GoSafe 的 recover 在
 // goroutine 出口，panic 会直接打死 worker，N 个 panic 任务耗尽整个 worker 池后
 // 队列塞满、消费停滞，整个后端瘫痪。收编后 panic 任务走既有重试/死信路径。
+//
+// panic 收编单源（#381 全矩阵战役，#173 行为修）：pkg errors.Recovered——
+// 此前 fmt.Errorf(%v) 把 panic 值拍平成纯文本，handler 以 panic 携带业务
+// error 时（仓内并不少见的传错误惯例）重试判定/死信归因的 error 身份
+// （errors.Is/As）当场断链，且没有栈可排障；PanicError 保证身份透传
+// （Unwrap）、goroutine 栈与 panic 值类型信息恒在场。
 func runHandlerSafe(ctx context.Context, handler Handler, task *Task) (err error) {
 	defer func() {
-		if r := recover(); r != nil {
-			err = fmt.Errorf("handler panic: %v", r)
+		if perr := pkgerrors.Recovered(recover()); perr != nil {
+			err = fmt.Errorf("handler panic: %w", perr)
 		}
 	}()
 	return handler(ctx, task)
 }
 
-// normalizeRetry 把非法的负 MaxRetry 归一为 0（至少执行一次、不重试），
+// NormalizeRetry 把非法的负 MaxRetry 归一为 0（至少执行一次、不重试），
 // 避免"未执行即进死信"的假死信。
-func normalizeRetry(task *Task) {
+//
+// 导出面（#169）：redis 嵌套模块（独立 module）此前被迫在 helpers.go 自持
+// 一份同形实现，两份漂移风险随单源消除。
+func NormalizeRetry(task *Task) {
 	if task.MaxRetry < 0 {
 		task.MaxRetry = 0
 	}
@@ -176,7 +187,20 @@ func WithClock(clock Clock) TimerTaskOption {
 type TimerTaskOption func(*config)
 
 // WithRetry 设置任务重试次数和延迟，默认 3 次，5 秒延迟。
+//
+// 构造期校验（#176，对齐同簇 NewSlidingWindow/NewLockout 的「配置错误启动
+// 即暴露」纪律）：count < 0 或 delay < 0 直接 panic——此前负 count 被下游
+// NormalizeRetry 隐式归 0，配置错误静默变义成「不重试」且与 Task.MaxRetry<0
+// 的显式「不重试」语义混同；负 delay 会让重试 timer 立即触发、MaxRetry 次
+// 忙重试。0 值合法：count=0 经 Send 的 MaxRetry 缺省补齐语义表达显式配置
+// （见 Task.MaxRetry 三态注释），delay=0 是显式零退避。
 func WithRetry(count int, delay time.Duration) TimerTaskOption {
+	if count < 0 {
+		panic(fmt.Sprintf("timertask: WithRetry: negative retry count %d", count))
+	}
+	if delay < 0 {
+		panic(fmt.Sprintf("timertask: WithRetry: negative retry delay %s", delay))
+	}
 	return func(c *config) {
 		c.retryCount = count
 		c.retryDelay = delay
