@@ -516,3 +516,33 @@ func TestScheduler_UnsatisfiableSpec(t *testing.T) {
 		t.Fatalf("@every 被误拒: %v", err)
 	}
 }
+
+// TestScheduler_Sentinels 钉住 #177：停机 / nil task 返回可 errors.Is 判定的
+// 哨兵错误——此前四处 errors.New 现造同串错误，调用方无法判定「实例已停机」，
+// cron.Scheduler 经 ScheduleFor 透传的也是不可判定的裸错误。
+func TestScheduler_Sentinels(t *testing.T) {
+	s, _ := newTestScheduler(t, Config{})
+	nop := func(context.Context, time.Time) error { return nil }
+
+	if err := s.Schedule("@every 1h", nil); !errors.Is(err, ErrNilTask) {
+		t.Fatalf("nil task = %v, want ErrNilTask（#177）", err)
+	}
+	// Reconcile 的 nil task 逐条汇总同样携带哨兵（%w 包装）
+	err := s.Reconcile([]Entry{{Key: "k1", Spec: "@every 1h"}})
+	if !errors.Is(err, ErrNilTask) {
+		t.Fatalf("reconcile nil task = %v, want errors.Is ErrNilTask（#177）", err)
+	}
+
+	if err := s.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	if err := s.Schedule("@every 1h", nop); !errors.Is(err, ErrSchedulerStopped) {
+		t.Fatalf("stopped Schedule = %v, want ErrSchedulerStopped（#177）", err)
+	}
+	if err := s.ScheduleFor("k2", "@every 1h", nop); !errors.Is(err, ErrSchedulerStopped) {
+		t.Fatalf("stopped ScheduleFor = %v, want ErrSchedulerStopped（#177）", err)
+	}
+	if err := s.Reconcile([]Entry{{Key: "k2", Spec: "@every 1h", Task: nop}}); !errors.Is(err, ErrSchedulerStopped) {
+		t.Fatalf("stopped Reconcile = %v, want ErrSchedulerStopped（#177）", err)
+	}
+}
