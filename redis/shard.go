@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/oekit/logx"
 	goredis "github.com/redis/go-redis/v9"
 )
 
@@ -87,7 +88,7 @@ func (s *ShardManager) heartbeat(ctx context.Context) {
 		Member: s.clientID,
 	}).Result()
 	if err != nil {
-		log.Error("heartbeat failed, clearing shards to avoid dual-ownership", "err", err)
+		log.Error("heartbeat failed, clearing shards to avoid dual-ownership", logx.ErrKey, err)
 		// 心跳失败时清除分片分配并门控后续分配，防止其他客户端抢走分片后出现双归属。
 		s.heartbeatOK.Store(false)
 		s.mu.Lock()
@@ -101,7 +102,7 @@ func (s *ShardManager) heartbeat(ctx context.Context) {
 	threshold := now - s.heartbeatTimeout.Milliseconds()
 	_, err = s.client.ZRemRangeByScore(ctx, key, "0", strconv.FormatInt(threshold, 10)).Result()
 	if err != nil {
-		log.Error("cleanup heartbeat failed", "err", err)
+		log.Error("cleanup heartbeat failed", logx.ErrKey, err)
 	}
 }
 
@@ -141,7 +142,7 @@ func (s *ShardManager) assignShards(ctx context.Context) {
 	// 获取所有在线客户端
 	members, err := s.client.ZRangeWithScores(ctx, key, 0, -1).Result()
 	if err != nil {
-		log.Error("get members failed", "err", err)
+		log.Error("get members failed", logx.ErrKey, err)
 		return
 	}
 

@@ -54,10 +54,17 @@ type RetryHooks struct {
 // 收编，pkg errors.Recovered 单源）+ RetryCount 推进。后端差异由 hooks
 // 注入（见 RetryHooks）。
 //
+// RetryCount 推进口径（#189）：**在入参累计值基础上推进**——base 取函数
+// 入口的 task.RetryCount（可携带跨 claim 周期的累计值，如 redis 租约回投
+// 计数），第 i 次尝试（i 从 0 起）看到 base+i，单调不回退；此前直接
+// `task.RetryCount = i` 会把入参累计值抹掉（3 → 1 的回退）。重试**预算**
+// 仍是每个 claim 周期一份（循环边界 i <= MaxRetry，不含 base）。
+//
 // 返回退出形态与最后一次错误。task 会被改写（RetryCount 推进、MaxRetry 经
 // NormalizeRetry 归一）——与两后端此前的行为一致，调用方传引擎内副本。
 func RunWithRetry(ctx context.Context, task *Task, handler Handler, retryDelay time.Duration, stop <-chan struct{}, hooks RetryHooks) (RetryOutcome, error) {
 	NormalizeRetry(task)
+	base := task.RetryCount // #189：入参累计值（跨 claim 周期的已重试次数）
 	fireInterrupted := func() {
 		if hooks.OnInterrupted != nil {
 			hooks.OnInterrupted()
@@ -89,7 +96,7 @@ func RunWithRetry(ctx context.Context, task *Task, handler Handler, retryDelay t
 				return RetryInterrupted, lastErr
 			case <-retryTimer.C:
 			}
-			task.RetryCount = i
+			task.RetryCount = base + i // #189：入参累计值 + 本轮尝试序号，单调不回退
 			if hooks.OnRetry != nil {
 				hooks.OnRetry(i, task.MaxRetry)
 			}

@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"sync/atomic"
 	"time"
 
+	"github.com/oekit/logx"
 	"github.com/oekit/timertask"
 	goredis "github.com/redis/go-redis/v9"
 )
@@ -15,8 +17,30 @@ import (
 // score = 租约到期时间（Unix 秒）。
 const processingKeyPattern = "{timertask.%s}.processing"
 
+// retryCountKeyPattern 是租约回投重试计数的 hash（#188）：field =
+// "<task_id>:<end_time>"，value = 该任务累计经历的租约到期回投次数。
+//
+// retry_count 必须移出 ZSet member：member 的去重键是整个字节串，
+// 回投路径把 retry_count+1 写回 member 会与 Send 产出的 member 差一个
+// 字段 ⇒ 同一任务同 fire_ts 两条条目 ⇒ 业务 handler 双跑（#76 的
+// 「同拍重发 = 同 member」不变量在回投路径失效）。member 归零携带
+// retry_count（canonicalMember），计数单源在本 hash。
+const retryCountKeyPattern = "{timertask.%s}.retry_count"
+
 // 租约时长的默认值由父模块 timertask.WithAtLeastOnce / WithVisibilityTimeout
 // 统一提供（经 timertask.ResolveOptions 下发），本模块不重复定义。
+
+// retryCountKey 返回 retry-count hash 的 key。
+func (b *RedisBackend) retryCountKey() string {
+	return fmt.Sprintf(retryCountKeyPattern, b.buzType)
+}
+
+// retryCountField 返回任务在 retry-count hash 里的 field。带 end_time 维度：
+// 同一 task_id 换 fire_ts 重投是「新的一轮预算」，字段天然隔离；终态
+// （成功 / 死信）由 ackTask 统一 HDel 清理，不留孤儿字段。
+func (b *RedisBackend) retryCountField(task *timertask.Task) string {
+	return task.ID + ":" + strconv.FormatInt(task.EndTime, 10)
+}
 
 // claimLeaseScript 原子 claim：score 到期则从分片 ZSet 移入 processing 租约集。
 //
@@ -49,7 +73,8 @@ var claimLeaseScript = goredis.NewScript(`
 // 两个半失败腿都不丢任务。
 //
 // KEYS[1]=shard zset, KEYS[2]=processing
-// ARGV[1]=score (EndTime), ARGV[2]=回投 member（重试计数已递增的规范化 JSON）,
+// ARGV[1]=score (EndTime), ARGV[2]=回投 member（canonicalMember 规范化产出，
+// 不携带真实 retry_count——计数在 retry-count hash，#188）,
 // ARGV[3]=processing member（原租约 member）
 var requeueLeaseScript = goredis.NewScript(`
 	redis.call('zadd', KEYS[1], tonumber(ARGV[1]), ARGV[2])
@@ -61,10 +86,19 @@ func (b *RedisBackend) processingKey() string {
 	return fmt.Sprintf(processingKeyPattern, b.buzType)
 }
 
-// ackTask 在 handler 成功（或终态死信）后删除租约记录。
+// ackTask 在 handler 成功（或终态死信）后删除租约记录，并顺手清掉
+// retry-count hash 字段（#188）：两条终态路径（worker 侧成功/死信、回扫侧
+// 死信）共用本收口，避免孤儿计数残留。毒丸 member 解析不出任务时跳过
+// HDel——无 ID 可清，hash 字段本来也没建过。
 func (b *RedisBackend) ackTask(ctx context.Context, member string) {
 	if err := b.client.ZRem(ctx, b.processingKey(), member).Err(); err != nil {
-		log.Error("ack ZRem failed", "member", member, "err", err)
+		log.Error("ack ZRem failed", "member", member, logx.ErrKey, err)
+	}
+	var task timertask.Task
+	if err := json.Unmarshal([]byte(member), &task); err == nil && task.ID != "" {
+		if err := b.client.HDel(ctx, b.retryCountKey(), b.retryCountField(&task)).Err(); err != nil {
+			log.Error("ack HDel retry count failed", "taskID", task.ID, logx.ErrKey, err)
+		}
 	}
 }
 
@@ -146,7 +180,7 @@ func (b *RedisBackend) renewLoop(ctx context.Context, member string, stop <-chan
 			}); err != nil {
 				// 续租失败只记日志：下个周期重试；连续失败到租约真正过期时，
 				// 由回扫兜底重投（at-least-once 语义退化为旧行为，不会丢）。
-				log.Error("lease renew failed", "member", member, "err", err)
+				log.Error("lease renew failed", "member", member, logx.ErrKey, err)
 			}
 		}
 	}
@@ -165,7 +199,7 @@ func (b *RedisBackend) reapExpiredLeases(ctx context.Context) {
 	}).Result()
 	if err != nil {
 		if err != goredis.Nil {
-			log.Error("reap ZRangeByScore error", "err", err)
+			log.Error("reap ZRangeByScore error", logx.ErrKey, err)
 		}
 		return
 	}
@@ -185,13 +219,22 @@ func (b *RedisBackend) reapExpiredLeases(ctx context.Context) {
 		// 一致（否则同一份任务在两条路径上的重试语义会分叉）。归一单源
 		// （#169）：根包导出的 timertask.NormalizeRetry。
 		timertask.NormalizeRetry(task)
-		task.RetryCount++
+		// 重试计数走 retry-count hash（#188）：member 不再携带真实
+		// retry_count（字节稳定，「回投 member = Send member」），计数单源
+		// 在 hash 里推进。HIncrBy 失败时租约保留、下轮回扫再投（at-least-once，
+		// 计数未推进只是少记一轮，不丢任务）。
+		count, err := b.client.HIncrBy(ctx, b.retryCountKey(), b.retryCountField(task), 1).Result()
+		if err != nil {
+			log.Error("reap incr retry count failed", "taskID", task.ID, logx.ErrKey, err)
+			continue
+		}
+		task.RetryCount = int(count)
 		// 判定「重试次数耗尽」**不能**再加 `task.MaxRetry > 0` 的守卫：
 		// MaxRetry<=0 时该守卫会让本分支永远不可达 ⇒ 租约到期后任务被无限
 		// 重投（既不进死信、也不停止）——而 worker 侧对同一份任务早就判过
 		// 「执行一次、不重试」了。
 		if task.RetryCount > task.MaxRetry {
-			// 租约重投次数耗尽 → 死信 + Ack
+			// 租约重投次数耗尽 → 死信 + Ack（ackTask 顺手清 hash 字段）
 			log.Error("lease requeue exhausted", "taskID", task.ID, "retryCount", task.RetryCount)
 			b.sendToDeadLetter(task)
 			b.ackTask(ctx, member)
@@ -200,9 +243,11 @@ func (b *RedisBackend) reapExpiredLeases(ctx context.Context) {
 			}
 			continue
 		}
-		data, err := json.Marshal(task)
+		// 回投 member 单源 canonicalMember（#188）：与 Send 产出同一字节串，
+		// 生产者同拍重发命中 ZAdd 的 score 更新而非新增条目。
+		data, err := b.canonicalMember(task)
 		if err != nil {
-			log.Error("reap marshal failed", "taskID", task.ID, "err", err)
+			log.Error("reap marshal failed", "taskID", task.ID, logx.ErrKey, err)
 			continue
 		}
 		key := b.taskKey(task.ID)
@@ -211,8 +256,8 @@ func (b *RedisBackend) reapExpiredLeases(ctx context.Context) {
 		// 再投；不可用同一条 pipeline 的命令顺序冒充原子面：非 MULTI/EXEC
 		// 逐条独立执行，「ZAdd 失败 + ZRem 成功」⇒ 两处皆空、永久丢失。
 		if err := requeueLeaseScript.Run(ctx, b.client, []string{key, pkey},
-			task.EndTime, string(data), member).Err(); err != nil {
-			log.Error("reap requeue failed", "taskID", task.ID, "err", err)
+			task.EndTime, data, member).Err(); err != nil {
+			log.Error("reap requeue failed", "taskID", task.ID, logx.ErrKey, err)
 			continue
 		}
 		log.Warn("lease expired, task requeued", "taskID", task.ID, "retryCount", task.RetryCount)

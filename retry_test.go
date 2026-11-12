@@ -131,3 +131,60 @@ func TestWithRetry_NegativeValues_Panic(t *testing.T) {
 		t.Fatalf("0 值应原样生效: retryCount=%d retryDelay=%v", cfg.retryCount, cfg.retryDelay)
 	}
 }
+
+// TestRunWithRetry_RetryCountCumulative 钉住 #189：RetryCount 是「已重试次数」
+// 的跨调用累计量，RunWithRetry 必须在入参基础上**推进**而不是用进程内尝试
+// 序号覆盖——入参携带租约回投累计值（redis 侧 task.RetryCount++，#188 后单源
+// 在 retry-count hash）时，handler 看到的序列单调不回退；耗尽退出后
+// task.RetryCount = base + MaxRetry（死信记录不再少报）。
+func TestRunWithRetry_RetryCountCumulative(t *testing.T) {
+	t.Run("入参累计值 3 时序列单调不回退", func(t *testing.T) {
+		task := &Task{ID: "cum-1", RetryCount: 3, MaxRetry: 3}
+		var seen []int
+		outcome, _ := RunWithRetry(context.Background(), task,
+			func(_ context.Context, task *Task) error {
+				seen = append(seen, task.RetryCount)
+				return errors.New("always fail")
+			}, time.Millisecond, nil, RetryHooks{})
+		if outcome != RetryExhausted {
+			t.Fatalf("outcome=%v, want RetryExhausted", outcome)
+		}
+		// 修复前实测 [3 1 2 3]：第 2 次尝试看到 1，比第 1 次的 3 小——回退。
+		for i := 1; i < len(seen); i++ {
+			if seen[i] < seen[i-1] {
+				t.Fatalf("RetryCount 序列回退: %v（#189：已重试次数必须单调不回退）", seen)
+			}
+		}
+		want := []int{3, 4, 5, 6}
+		if len(seen) != len(want) {
+			t.Fatalf("handler 看到序列 %v, want %v", seen, want)
+		}
+		for i := range want {
+			if seen[i] != want[i] {
+				t.Fatalf("handler 看到序列 %v, want %v", seen, want)
+			}
+		}
+		if task.RetryCount != 6 {
+			t.Fatalf("退出后 task.RetryCount=%d, want 6（累计值不被抹掉）", task.RetryCount)
+		}
+	})
+
+	t.Run("对照组：入参 0 时序列不变 [0 1 2 3]", func(t *testing.T) {
+		task := &Task{ID: "cum-0", MaxRetry: 3}
+		var seen []int
+		RunWithRetry(context.Background(), task,
+			func(_ context.Context, task *Task) error {
+				seen = append(seen, task.RetryCount)
+				return errors.New("always fail")
+			}, time.Millisecond, nil, RetryHooks{})
+		want := []int{0, 1, 2, 3}
+		if len(seen) != len(want) {
+			t.Fatalf("handler 看到序列 %v, want %v", seen, want)
+		}
+		for i := range want {
+			if seen[i] != want[i] {
+				t.Fatalf("handler 看到序列 %v, want %v（入参 0 的既有口径不得变化）", seen, want)
+			}
+		}
+	})
+}

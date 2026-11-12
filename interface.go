@@ -35,7 +35,11 @@ type Task struct {
 	Action     string `json:"action"`      // 任务类型/动作名
 	Param      string `json:"param"`       // 业务参数（JSON 字符串）
 	Extra      string `json:"extra"`       // 扩展字段
-	RetryCount int    `json:"retry_count"` // 已重试次数
+	// RetryCount 已重试次数——**跨 claim 周期累计、单调不回退**（#189）：
+	// handler 与死信记录看到的值 = 入参/租约回投累计 + 本轮已试次数。
+	// 注意它与重试预算是两回事：预算（RunWithRetry 的循环边界）按每个
+	// claim 周期一份 MaxRetry 计，不含本字段的历史累计。
+	RetryCount int `json:"retry_count"`
 	// MaxRetry 最大重试次数。三态语义（此前只写「最大重试次数」，调用方
 	// 按字面理解会踩坑）：
 	//

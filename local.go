@@ -313,7 +313,7 @@ func (b *LocalBackend) processTask(ctx context.Context, task *Task) {
 			logger.Warn("retrying task", "taskID", task.ID, "attempt", attempt, "maxRetry", maxRetry)
 		},
 		OnError: func(err error) {
-			logger.Error("handler error", "taskID", task.ID, "err", err)
+			logger.Error("handler error", "taskID", task.ID, ErrKey, err)
 		},
 	})
 	switch outcome {
@@ -322,7 +322,7 @@ func (b *LocalBackend) processTask(ctx context.Context, task *Task) {
 		return
 	case RetryExhausted:
 		// 重试次数用完，记录失败
-		logger.Error("task failed after retries", "taskID", task.ID, "maxRetry", task.MaxRetry, "err", err)
+		logger.Error("task failed after retries", "taskID", task.ID, "maxRetry", task.MaxRetry, ErrKey, err)
 		if b.onFailure != nil {
 			b.onFailure(task, err)
 		}
