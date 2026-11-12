@@ -12,6 +12,7 @@ import (
 
 	pkgerrors "github.com/oekit/pkg/errors"
 
+	"github.com/oekit/timertask"
 	"github.com/oekit/timertask/internal/gosafe"
 	"github.com/oekit/timertask/local"
 )
@@ -223,7 +224,7 @@ func New(exec Executor, opts ...CronOption) *Scheduler {
 			// Start 返回值按 local.Start 语义（#99）：停机正常路径也带
 			// ctx.Err()——只对意外错误留痕。
 			if err := s.inner.Start(s.engineCtx); err != nil && !errors.Is(err, context.Canceled) {
-				s.log.Error("trigger engine stopped with error", "err", err)
+				s.log.Error("trigger engine stopped with error", timertask.ErrKey, err)
 			}
 		})
 	})
@@ -364,7 +365,7 @@ func (s *Scheduler) StartReconcile(ctx context.Context, interval time.Duration, 
 	if s.cfg.staleSweep != nil {
 		swept, err := s.cfg.staleSweep(ctx)
 		if err != nil {
-			s.log.Warn("stale sweep failed", "swept", swept, "err", err)
+			s.log.Warn("stale sweep failed", "swept", swept, timertask.ErrKey, err)
 		} else {
 			s.log.Info("stale sweep done", "swept", swept)
 		}
@@ -459,11 +460,11 @@ func (s *Scheduler) install(_ context.Context, p Plan) error {
 func (s *Scheduler) reconcileOnce(ctx context.Context, listFn func() ([]Plan, error)) {
 	plans, err := listFn()
 	if err != nil {
-		s.log.Error("list plans failed, will retry next tick", "err", err)
+		s.log.Error("list plans failed, will retry next tick", timertask.ErrKey, err)
 		return
 	}
 	if err := s.Reconcile(ctx, plans); err != nil {
-		s.log.Warn("reconcile partial failure", "err", err)
+		s.log.Warn("reconcile partial failure", timertask.ErrKey, err)
 	}
 }
 
@@ -492,7 +493,7 @@ func (s *Scheduler) fire(ctx context.Context, planID string, at time.Time) error
 	}
 	if err != nil {
 		s.recordSkip(ctx, planID, trigger, err)
-		s.log.Error("exec slot lock failed, trigger skipped", "plan", planID, "trigger", trigger, "err", err)
+		s.log.Error("exec slot lock failed, trigger skipped", "plan", planID, "trigger", trigger, timertask.ErrKey, err)
 		return nil
 	}
 	if innerOwner == "" {
@@ -514,7 +515,7 @@ func (s *Scheduler) fire(ctx context.Context, planID string, at time.Time) error
 		case merr != nil:
 			// 互斥设施故障：fail-closed 跳过（宁可漏跑一轮可补发，不可双跑）。
 			s.recordSkip(ctx, planID, trigger, merr)
-			s.log.Error("exec mutex failed, trigger skipped", "plan", planID, "trigger", trigger, "err", merr)
+			s.log.Error("exec mutex failed, trigger skipped", "plan", planID, "trigger", trigger, timertask.ErrKey, merr)
 			return nil
 		case owner == "":
 			// 防御：同上，空 ownerID 按未获得处置。

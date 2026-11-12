@@ -11,6 +11,8 @@ import (
 	pkgerrors "github.com/oekit/pkg/errors"
 	"github.com/oekit/pkg/timex/cron"
 
+	"github.com/oekit/timertask"
+
 	"github.com/oekit/timertask/internal/gosafe"
 )
 
@@ -449,9 +451,9 @@ func (s *Scheduler) execute(e *entry, at time.Time) {
 	if err := s.invoke(ctx, e, at); err != nil {
 		// 业务键形态（#129）的条目带 key 日志，便于调度平台按任务 ID 排障
 		if e.key != "" {
-			s.log.Error("cron task failed", "spec", e.spec, "key", e.key, "at", at, "err", err)
+			s.log.Error("cron task failed", "spec", e.spec, "key", e.key, "at", at, timertask.ErrKey, err)
 		} else {
-			s.log.Error("cron task failed", "spec", e.spec, "at", at, "err", err)
+			s.log.Error("cron task failed", "spec", e.spec, "at", at, timertask.ErrKey, err)
 		}
 	}
 }

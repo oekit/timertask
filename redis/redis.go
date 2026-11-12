@@ -163,6 +163,12 @@ func NewRedisBackend(buzType string, client goredis.UniversalClient, handler tim
 // 都落在内部副本上（Task 全为值字段，浅拷贝即全量拷贝），调用方提交后继续
 // 读/复用自己的 Task 结构不会看到字段被引擎改写。
 //
+// #188：member 里不再携带真实 retry_count（归零写入）——member 必须在任务
+// **整个生命周期**内字节稳定，租约到期回投（reapExpiredLeases）才可能与
+// Send 产出同一 member，「同拍重发 = 同 member」才能在「任务经历过租约到期」
+// 之后继续成立；真实重试计数在 retry-count hash（见 retryCountKey），handler
+// 与死信记录看到的是累计值（#189 口径）。
+//
 // 后端停机后（Start 已返回）返回 timertask.ErrBackendStopped（#124）：实例
 // 的消费循环已经退出，继续投递只会制造「写入成功、本实例零消费」的错觉；
 // 要继续投递请重建实例或换用存活实例。
@@ -176,17 +182,12 @@ func (b *RedisBackend) Send(ctx context.Context, task *timertask.Task) error {
 	if stopped {
 		return timertask.ErrBackendStopped
 	}
-	// 规范化 member：拷贝后补 MaxRetry 缺省、钉 CreateTime=EndTime
-	// （CreateTime 的补 now 随 #75 的钉死早已到不了 member，随 #97 一并移除）；
-	// 其余字段与调用方输入逐字节一致——两次 Send 同参 ⇒ 同 member。
-	c := *task
-	if c.MaxRetry == 0 {
-		c.MaxRetry = b.retryCount
-	}
-	c.CreateTime = c.EndTime
-	data, err := json.Marshal(&c)
+	// 规范化 member 单源 canonicalMember（#188）：补 MaxRetry 缺省、钉
+	// CreateTime=EndTime（#75）、RetryCount 归零（#188）——Send 与租约回投
+	// 两条写入面共用同一产出，「同拍重发 = 同 member」自此跨租约周期成立。
+	data, err := b.canonicalMember(task)
 	if err != nil {
-		return fmt.Errorf("timertask: marshal task: %w", err)
+		return err
 	}
 
 	key := b.taskKey(task.ID)
@@ -365,7 +366,7 @@ func (b *RedisBackend) requeueClaim(ctx context.Context, c *claim) bool {
 	task := c.task
 	data, err := json.Marshal(task)
 	if err != nil {
-		log.Error("requeue marshal failed", "taskID", task.ID, "err", err)
+		log.Error("requeue marshal failed", "taskID", task.ID, logx.ErrKey, err)
 		return false
 	}
 	key := b.taskKey(task.ID)
@@ -374,14 +375,14 @@ func (b *RedisBackend) requeueClaim(ctx context.Context, c *claim) bool {
 			Score:  float64(task.EndTime),
 			Member: string(data),
 		}).Err(); err != nil {
-			log.Error("requeue ZAdd failed", "taskID", task.ID, "err", err)
+			log.Error("requeue ZAdd failed", "taskID", task.ID, logx.ErrKey, err)
 			return false
 		}
 		return true
 	}
 	if err := requeueLeaseScript.Run(ctx, b.client, []string{key, b.processingKey()},
 		task.EndTime, string(data), c.member).Err(); err != nil {
-		log.Error("requeue failed", "taskID", task.ID, "err", err)
+		log.Error("requeue failed", "taskID", task.ID, logx.ErrKey, err)
 		return false
 	}
 	return true
@@ -438,7 +439,7 @@ func (b *RedisBackend) consumeRemoteOnce(ctx context.Context) {
 		}).Result()
 		if err != nil {
 			if !errors.Is(err, goredis.Nil) {
-				log.Error("ZRangeByScore error", "err", err)
+				log.Error("ZRangeByScore error", logx.ErrKey, err)
 			}
 			continue
 		}
@@ -454,7 +455,7 @@ func (b *RedisBackend) consumeRemoteOnce(ctx context.Context) {
 				ok = result > 0
 			}
 			if err != nil {
-				log.Error("claim script error", "err", err)
+				log.Error("claim script error", logx.ErrKey, err)
 				continue
 			}
 			if ok {
@@ -596,6 +597,36 @@ func (b *RedisBackend) processTask(ctx context.Context, c *claim) {
 			<-renewExited
 		}()
 	}
+	// #188/#189：重试基线取累计值——member 不再携带真实 retry_count（#188
+	// 归零写入保证字节稳定），租约回投次数在 retry-count hash 里；与 member
+	// 解析出的历史值取大者（升级窗口内旧格式 member 的兼容口径：旧 member
+	// 里可能还带着回投累加过的真实计数，而 hash 尚未建过字段）。
+	//
+	// HGet 套弃子限时（#121 纪律）：Redis 黑洞时不能把 worker 挂住——读不到
+	// 累计值只影响 handler 可见性与死信记录的口径（预算仍按本 claim 周期的
+	// MaxRetry 走）。迟到值经缓冲 channel 丢弃、绝不从弃子 goroutine 里改写
+	// task（避免与 RunWithRetry 并发写同一段竞争）。
+	if b.delivery == timertask.DeliveryAtLeastOnce {
+		baseSeen := make(chan int64, 1)
+		_ = bestEffortRedisTimeout("get_retry_count", bestEffortTimeout, func(callCtx context.Context) error {
+			n, err := b.client.HGet(callCtx, b.retryCountKey(), b.retryCountField(task)).Int64()
+			if err != nil && !errors.Is(err, goredis.Nil) {
+				log.Error("get retry count failed", "taskID", task.ID, logx.ErrKey, err)
+				return nil // 读不到累计值不拦处理，返回 nil 免弃子日志误报
+			}
+			if err == nil {
+				baseSeen <- n
+			}
+			return nil
+		})
+		select {
+		case n := <-baseSeen:
+			if n > int64(task.RetryCount) {
+				task.RetryCount = int(n)
+			}
+		default:
+		}
+	}
 	outcome, err := timertask.RunWithRetry(ctx, task, b.handler, b.retryDelay, b.stopChan, timertask.RetryHooks{
 		// #151：停机打断导致的失败不算真失败——已取消的 ctx 下 handler 必然
 		// 立刻失败，继续重试只会耗尽次数把「从未真正处理」的任务写进死信
@@ -610,7 +641,7 @@ func (b *RedisBackend) processTask(ctx context.Context, c *claim) {
 			log.Warn("retrying task", "taskID", task.ID, "attempt", attempt, "maxRetry", maxRetry)
 		},
 		OnError: func(err error) {
-			log.Error("handler error", "taskID", task.ID, "err", err)
+			log.Error("handler error", "taskID", task.ID, logx.ErrKey, err)
 		},
 	})
 	switch outcome {
@@ -621,7 +652,7 @@ func (b *RedisBackend) processTask(ctx context.Context, c *claim) {
 		return
 	case timertask.RetryExhausted:
 		// 重试次数用完：先写入持久死信（best-effort），再触发进程内回调
-		log.Error("task failed after retries", "taskID", task.ID, "maxRetry", task.MaxRetry, "err", err)
+		log.Error("task failed after retries", "taskID", task.ID, "maxRetry", task.MaxRetry, logx.ErrKey, err)
 		b.sendToDeadLetter(task)
 		if b.onFailure != nil {
 			b.onFailure(task, err)
@@ -637,7 +668,7 @@ func (b *RedisBackend) processTask(ctx context.Context, c *claim) {
 func (b *RedisBackend) sendToDeadLetter(task *timertask.Task) {
 	data, err := json.Marshal(task)
 	if err != nil {
-		log.Error("dead letter marshal failed", "taskID", task.ID, "err", err)
+		log.Error("dead letter marshal failed", "taskID", task.ID, logx.ErrKey, err)
 		return
 	}
 	b.deadLetterWrite("dead_letter", string(data))
@@ -702,7 +733,7 @@ func bestEffortRedisTimeout(op string, timeout time.Duration, fn func(ctx contex
 		defer close(done)
 		fnErr = fn(ctx)
 		if fnErr != nil {
-			log.Error("best-effort redis write failed", "op", op, "err", fnErr)
+			log.Error("best-effort redis write failed", "op", op, logx.ErrKey, fnErr)
 		}
 	})
 
@@ -729,10 +760,38 @@ func (b *RedisBackend) now() time.Time {
 func (b *RedisBackend) parseTask(data string) *timertask.Task {
 	var task timertask.Task
 	if err := json.Unmarshal([]byte(data), &task); err != nil {
-		log.Error("unmarshal error", "err", err)
+		log.Error("unmarshal error", logx.ErrKey, err)
 		return nil
 	}
 	return &task
+}
+
+// canonicalMember 把任务规范化为 ZSet member 字节串（#188 单源）：
+//   - MaxRetry 经 NormalizeRetry 归一（负数 = 不重试 ⇒ 0）后补缺省（0 = 未
+//     指定 ⇒ 后端默认，#75/#97）；
+//   - CreateTime 钉为 EndTime（#75，member 里「创建时刻」不存在）；
+//   - RetryCount 归零（#188）——真实重试计数在 retry-count hash
+//     （redis_reliable.go），member 必须在任务整个生命周期内字节稳定：
+//     Send 与租约到期回投（reapExpiredLeases）两条写入面共用本函数，
+//     「同拍重发 = 同 member」与「回投 member = Send member」自此同一字节串，
+//     生产者 at-least-once 重发命中 ZAdd 的 score 更新而非新增条目。
+//
+// 历史格式 member（含非零 retry_count 的旧版本写入）解析不受影响；升级窗口
+// 内「旧 member 未消费 + 新 member 重发」会短暂并存两条（重发与旧条目字节
+// 不同），随旧条目消费/撤销自然排空——升级说明见 issue #188。
+func (b *RedisBackend) canonicalMember(t *timertask.Task) (string, error) {
+	c := *t
+	timertask.NormalizeRetry(&c)
+	if c.MaxRetry == 0 {
+		c.MaxRetry = b.retryCount
+	}
+	c.CreateTime = c.EndTime
+	c.RetryCount = 0
+	data, err := json.Marshal(&c)
+	if err != nil {
+		return "", fmt.Errorf("timertask: marshal task: %w", err)
+	}
+	return string(data), nil
 }
 
 // PendingCount 返回队列中待处理任务数（所有分片的 ZSet 大小之和）。

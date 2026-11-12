@@ -24,7 +24,9 @@
 - 门面 `github.com/oekit/logx`：业务服务 `logx.WithService("svc")`；
   **SDK/基础包必须 `logx.Delegating("组件名")` 懒解析**（禁止 Default()/WithService 声明包级 logger）
 - kv 结构化风格为默认；`Ctx*` 方法自动携带 trace_id；禁止 printf 风格 `logx.Infof` 作为主要手段
-- 错误字段名统一用 `logx.ErrKey` 常量（值 "err"），禁止手写 "err"/"error" 字面量（两矩阵落同一 Loki/ES）
+- 错误字段名统一用 `logx.ErrKey` 常量（值 "err"），禁止手写 "err"/"error" 字面量（两矩阵落同一 Loki/ES）。
+  豁免口径（#193）：按 logging.go 依赖政策不引 logx 的模块（根模块含 local/cron 子包），
+  用根包导出的仓内单源常量 `timertask.ErrKey`（同值，redis 模块内有与 logx.ErrKey 的同值对照测试钉死）
 - 后端经 `logx.SetDefault` 替换；`LOG_LEVEL` 环境变量统一生效
 
 ### 并发安全
