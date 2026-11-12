@@ -1,3 +1,7 @@
+## [v0.5.2] — 2026-11-13
+
+- 3 单修复（L13 车道 #188/#189/#193）；地板对齐 pkg v0.47.0。
+
 ## [v0.5.1] — 2026-11-12
 
 - Go 1.26 现代化：redis/shard.go sort.Strings→slices.Sort、local/scheduler.go 计数循环→range N；嵌套 redis 地板对齐 concurrency v0.34.1。纯等价重构+地板追平，行为零变更。
