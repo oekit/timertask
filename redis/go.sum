@@ -12,8 +12,8 @@ github.com/oekit/concurrency v0.34.0 h1:iYduDRRFtlENd9Yw9hD7KBdFWed8DgDSqlwPIYeX
 github.com/oekit/concurrency v0.34.0/go.mod h1:hhdqG+ff4GnPvpBjUy8+ce25TRyvy52Wh7Tlf2Gilsg=
 github.com/oekit/logx v0.10.0 h1:swoa1h9oLMdoH6LVjHaTYFIlVSxwRlfV0lBMNmKFfLI=
 github.com/oekit/logx v0.10.0/go.mod h1:hGifsM8pfOb8cR4KSmJE2j2oy3Q9KLEwKcfAgj+M/yY=
-github.com/oekit/pkg v0.45.0 h1:VDUWqUcCHHfQKFk+jM55LwdPoOEU6eOBsWrmog+9x8w=
-github.com/oekit/pkg v0.45.0/go.mod h1:Cr6sJpBX2a0gAIgLa32+NY69h/UZtuN6L1ZdXtP9upo=
+github.com/oekit/pkg v0.46.0 h1:/c8p9EH2RdJgFPNjp1QQWc8jSU0zGS85MotwS7R6D6M=
+github.com/oekit/pkg v0.46.0/go.mod h1:Cr6sJpBX2a0gAIgLa32+NY69h/UZtuN6L1ZdXtP9upo=
 github.com/redis/go-redis/v9 v9.23.0 h1:/TTVdJa8BRNsybwwGGnmiYktHNlUXtbOQxlWpHBPL3s=
 github.com/redis/go-redis/v9 v9.23.0/go.mod h1:EWP2UUk+XDaI1s5nQB5mablZN6vccXlmBQTyfnF87D0=
 github.com/stretchr/testify v1.12.1 h1:EuwCh5fleGS7H32xRwO3wRGT7DxrDhLAT6FF8MpWDWE=
