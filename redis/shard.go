@@ -7,7 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"hash/fnv"
-	"sort"
+	"slices"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -158,11 +158,11 @@ func (s *ShardManager) assignShards(ctx context.Context) {
 	}
 
 	// 排序确保一致性
-	sort.Strings(clients)
+	slices.Sort(clients)
 
 	// 一致性哈希分配
 	var myShards []int
-	for shard := 0; shard < s.totalShards; shard++ {
+	for shard := range s.totalShards {
 		// 使用 FNV-1a 哈希分配（simpleHash）
 		hash := simpleHash(s.buzType + "-" + strconv.Itoa(shard))
 		idx := shardIndex(hash, len(clients))

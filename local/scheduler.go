@@ -571,7 +571,7 @@ func (e *entry) takeDue(now time.Time, policy CatchUpPolicy, max int) ([]time.Ti
 
 	var points []time.Time
 	t := e.lastFire
-	for i := 0; i < max; i++ {
+	for range max {
 		nxt := e.schedule.Next(t)
 		if nxt.IsZero() || nxt.After(now) {
 			break
