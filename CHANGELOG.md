@@ -1,3 +1,7 @@
+## [v0.5.1] — 2026-11-12
+
+- Go 1.26 现代化：redis/shard.go sort.Strings→slices.Sort、local/scheduler.go 计数循环→range N；嵌套 redis 地板对齐 concurrency v0.34.1。纯等价重构+地板追平，行为零变更。
+
 ## [redis/v0.2.20] — 2026-11-12
 
 - refactor(local,cron): 全仓重构收敛——Scheduler「entries+keyed 双表快照」四处收集块收敛为 snapshotEntries()（#167）；goSafe 同模块三份拷贝（logging.go/local/cron）收敛到 internal/gosafe 单源、日志统一补 stack 字段、修正 local「刻意不 import 根包」失实注释（#168）；cron spec「解析+时区+可满足性」三连抄收敛为 parseSpec/checkSatisfiable（三处错误文案逐字不变，#170）；mustJSON 测试辅助从生产文件挪进 _test.go（#172）
