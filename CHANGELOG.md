@@ -12,6 +12,8 @@
 
 ## [v0.5.3] — 2026-11-13
 
+> ⚠️ **勘误（#217）**：本节声称的 #197 修复**实际首发于 v0.5.4**——本 tag 落点（04:56 UTC）早于修复 PR #209 合入 main（05:12 UTC），prewrite CHANGELOG → tag 的顺序把「版本节声称」与「tag 实际内容」劈开。消费者按本节定位 #197 会落空，请以 **v0.5.4** 节为准（同源劈叉见嵌套 redis/v0.2.21 节）。
+
 - fix(redis): 死信+摘租约 Lua 原子面——四路径半失败不再丢任务（#197）。新增 deadLetterAckScript：写失败即中止（租约保留下轮重试），成功后裁剪+摘租约；死信 member=marshal(task) 真实计数（#189）、摘租约 member=原始字节（#188）两参数分离。RetryExhausted 失败不置 terminal、onFailure 移到确认进死信后。
 
 关联问题单：timertask#197。
