@@ -16,6 +16,14 @@ import (
 // （种毒丸用）及 handler 调用计数。
 func newPoisonTestBackend(t *testing.T, delivery timertask.DeliveryMode) (*RedisBackend, func() int32) {
 	t.Helper()
+	b, _, calls := newPoisonTestBackendMR(t, delivery)
+	return b, calls
+}
+
+// newPoisonTestBackendMR 同 newPoisonTestBackend 但返回 miniredis 实例
+// （#197 需要对死信 key 注入写失败）。
+func newPoisonTestBackendMR(t *testing.T, delivery timertask.DeliveryMode) (*RedisBackend, *miniredis.Miniredis, func() int32) {
+	t.Helper()
 	mr := miniredis.RunT(t)
 	c := goredis.NewClient(&goredis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = c.Close() })
@@ -45,7 +53,7 @@ func newPoisonTestBackend(t *testing.T, delivery timertask.DeliveryMode) (*Redis
 	b.shardManager.mu.Lock()
 	b.shardManager.myShards = []int{0}
 	b.shardManager.mu.Unlock()
-	return b, calls.Load
+	return b, mr, calls.Load
 }
 
 // TestRedisBackend_PoisonMember_DeadLetter_AtMostOnce 钉住 #175（claim 路径，
@@ -143,5 +151,53 @@ func TestRedisBackend_PoisonLease_ReapedToDeadLetter(t *testing.T) {
 	}
 	if n, _ := b.client.ZCard(ctx, "{timertask.test}.processing").Result(); n != 0 {
 		t.Fatalf("processing 租约残留 %d 条, want 0（止损）", n)
+	}
+}
+
+// —— #197：死信写失败必须保留租约，恢复后重写成功 ——
+
+// TestRedisBackend_DeadLetterAckFailureKeepsLease 钉住 #197 主诉：四条
+// 「死信 + Ack」此前是两条独立往返——死信写被 bestEffortRedis 吞错后 Ack
+// 照常执行，毒丸从 processing 摘除后三处皆无（不在分片、不在 processing、
+// 不在死信），at-least-once「不容忍丢失」与「重试耗尽进持久死信」双双击穿。
+// 现走同一 Lua 原子面：写失败 ⇒ 租约保留，下轮回扫重试；恢复后收敛。
+func TestRedisBackend_DeadLetterAckFailureKeepsLease(t *testing.T) {
+	b, mr, _ := newPoisonTestBackendMR(t, timertask.DeliveryAtLeastOnce)
+	ctx := context.Background()
+
+	poison := `{"task_id":"poison-197","broken`
+	deadKey := "{timertask.test}.dead"
+
+	// 种过期毒丸租约（score=0 必然被回扫选中）。
+	if err := b.client.ZAdd(ctx, b.processingKey(), goredis.Z{
+		Score:  0,
+		Member: poison,
+	}).Err(); err != nil {
+		t.Fatalf("seed lease: %v", err)
+	}
+
+	// 注入写失败（miniredis 全局错误窗，模拟 maxmemory 逐出 / WRONGTYPE /
+	// 黑洞窗口）；错误窗内客户端命令全挂，reap 的死信脚本失败即止。
+	mr.SetError("ERR simulated dead letter write failure")
+	b.reapExpiredLeases(ctx)
+	mr.SetError("") // 关窗恢复，随后断言持久状态
+
+	// 断言①：租约保留（修复前：Ack 照常执行，member 三处皆无）。
+	// ZScore err=nil 即 member 存在（种入的 score 本就是 0）。
+	if _, err := b.client.ZScore(ctx, b.processingKey(), poison).Result(); err != nil {
+		t.Fatalf("★ #197 死信失败必须保留租约（下轮回扫重试）: %v", err)
+	}
+	// 断言②：死信 ZSet 不得有半写条目。
+	if n, _ := b.client.ZCard(ctx, deadKey).Result(); n != 0 {
+		t.Fatalf("死信写失败不应留半写条目, dead=%d", n)
+	}
+
+	// 恢复写入 → 下轮回扫收敛：进死信 + 摘租约。
+	b.reapExpiredLeases(ctx)
+	if n, _ := b.client.ZCard(ctx, deadKey).Result(); n != 1 {
+		t.Fatalf("★ 恢复后死信应恰有 1 条, got %d", n)
+	}
+	if _, err := b.client.ZScore(ctx, b.processingKey(), poison).Result(); err == nil {
+		t.Fatal("★ 恢复后租约应已摘除（收敛）")
 	}
 }

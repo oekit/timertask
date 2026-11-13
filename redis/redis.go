@@ -464,13 +464,18 @@ func (b *RedisBackend) consumeRemoteOnce(ctx context.Context) {
 					// #175：毒丸 member 不能静默丢弃——claim 已原子删除
 					// （at-most-once）或移入租约集（at-least-once），直接丢
 					// 弃 = 任务三处皆无、无取证痕迹，绕过专为止损取证设计的
-					// 死信 ZSet。原样写死信（best-effort，与 sendToDeadLetter
-					// 同纪律）。
-					b.sendToDeadLetterRaw(data)
+					// 死信 ZSet。
+					// #197：at-least-once 分支的「死信 + 摘租约」走同一 Lua
+					// 原子面——失败保留租约下轮重试（此前 bestEffort 吞错 +
+					// 独立 Ack 会让毒丸三处皆无）；at-most-once 无租约可保留，
+					// 死信维持 best-effort（该语义本就允许丢）。
 					if b.delivery == timertask.DeliveryAtLeastOnce {
-						// 租约集里的毒丸不会有真执行，摘租约止损——不摘会被
-						// 回扫再次判脏，死信出现重复条目。
-						b.ackTask(ctx, data)
+						if err := b.deadLetterAck(ctx, "dead_letter_poison", data, data); err != nil {
+							log.Error("dead letter ack failed, lease kept for retry",
+								"member", data, logx.ErrKey, err)
+						}
+					} else {
+						b.sendToDeadLetterRaw(data)
 					}
 					log.Error("failed to parse task from ZSet, raw member sent to dead letter", "key", key)
 					continue
@@ -651,13 +656,21 @@ func (b *RedisBackend) processTask(ctx context.Context, c *claim) {
 		// 中断处置已由 OnInterrupted 钩子完成；不 Ack，租约由回扫兜底。
 		return
 	case timertask.RetryExhausted:
-		// 重试次数用完：先写入持久死信（best-effort），再触发进程内回调
+		// 重试次数用完：死信 + 摘租约走同一 Lua 原子面（#197）。
+		// 死信失败 ⇒ **不置 terminal**（defer 不摘租约，租约保留、下轮
+		// 回扫重试死信写入）；onFailure 只在确认进死信后触发——回扫重试
+		// 成功才回调，不重复不丢失。此前 bestEffort 吞错 + 独立 Ack 会让
+		// 耗尽任务三处皆无（at-least-once「不容忍丢失」击穿）。
 		log.Error("task failed after retries", "taskID", task.ID, "maxRetry", task.MaxRetry, logx.ErrKey, err)
-		b.sendToDeadLetter(task)
+		if dlErr := b.deadLetterTaskAck(ctx, "dead_letter", task, c.member); dlErr != nil {
+			log.Error("dead letter ack failed, lease kept for retry",
+				"taskID", task.ID, logx.ErrKey, dlErr)
+			break
+		}
 		if b.onFailure != nil {
 			b.onFailure(task, err)
 		}
-		// 终态（已进死信）：租约可以释放。
+		// 终态（已进死信）：租约可以释放（defer Ack 幂等——脚本已摘）。
 		terminal = true
 	}
 }
