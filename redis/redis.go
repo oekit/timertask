@@ -656,12 +656,27 @@ func (b *RedisBackend) processTask(ctx context.Context, c *claim) {
 		// 中断处置已由 OnInterrupted 钩子完成；不 Ack，租约由回扫兜底。
 		return
 	case timertask.RetryExhausted:
-		// 重试次数用完：死信 + 摘租约走同一 Lua 原子面（#197）。
-		// 死信失败 ⇒ **不置 terminal**（defer 不摘租约，租约保留、下轮
-		// 回扫重试死信写入）；onFailure 只在确认进死信后触发——回扫重试
-		// 成功才回调，不重复不丢失。此前 bestEffort 吞错 + 独立 Ack 会让
-		// 耗尽任务三处皆无（at-least-once「不容忍丢失」击穿）。
+		// 重试次数用完。按投递语义分口径（#214：本路径漏分 at-most-once
+		// 曾把 onFailure 永久吞掉——它是唯一通知面）：
+		//
+		// at-most-once：claim 走 deleteScript 直删分片（无租约可保留）、
+		// reapLoop 仅 at-least-once 启动（无下轮回扫）——死信失败时任务
+		// 三处皆无，onFailure 必须无条件触发（回退 #197 前行为；同 PR 的
+		// claim 毒丸路径已按此分支，口径对齐）。
+		//
+		// at-least-once：死信 + 摘租约走 Lua 原子面（#197）。死信失败 ⇒
+		// **不置 terminal**（defer 不摘租约，租约保留、下轮回扫重试）；
+		// onFailure 只在确认进死信后触发——回扫重试成功才回调，不重复
+		// 不丢失。
 		log.Error("task failed after retries", "taskID", task.ID, "maxRetry", task.MaxRetry, logx.ErrKey, err)
+		if b.delivery != timertask.DeliveryAtLeastOnce {
+			b.sendToDeadLetter(task) // best-effort：无租约无重试，失败只能记日志
+			if b.onFailure != nil {
+				b.onFailure(task, err)
+			}
+			terminal = true // 语义终态；defer Ack 的条件本就含 at-least-once
+			break
+		}
 		if dlErr := b.deadLetterTaskAck(ctx, "dead_letter", task, c.member); dlErr != nil {
 			log.Error("dead letter ack failed, lease kept for retry",
 				"taskID", task.ID, logx.ErrKey, dlErr)
