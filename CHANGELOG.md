@@ -1,3 +1,9 @@
+## [redis/v0.2.21] — 2026-11-13
+
+- fix: 死信+摘租约 Lua 原子面——四路径半失败不再丢任务（timertask#197）。deadLetterAckScript 先死信失败即中止（租约保留重试），死信/租约两 member 分离保 #188/#189 计数口径；RetryExhausted 失败不置 terminal。
+
+关联问题单：timertask#197。
+
 ## [v0.5.3] — 2026-11-13
 
 - fix(redis): 死信+摘租约 Lua 原子面——四路径半失败不再丢任务（#197）。新增 deadLetterAckScript：写失败即中止（租约保留下轮重试），成功后裁剪+摘租约；死信 member=marshal(task) 真实计数（#189）、摘租约 member=原始字节（#188）两参数分离。RetryExhausted 失败不置 terminal、onFailure 移到确认进死信后。
