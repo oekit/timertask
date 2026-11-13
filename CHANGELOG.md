@@ -1,3 +1,9 @@
+## [v0.5.4] — 2026-11-13
+
+- 租约/死信原子面：回投 member 字节稳定 + retry_count 迁 hash（#188）、RunWithRetry 基线取入参 RetryCount（#189）、日志 err 键根模块单源常量（#193）、死信写入与租约 Ack 原子化防毒丸无痕丢失（#197）、回归假绿修复 + RetryExhausted at-most-once 分支（#214）
+
+关联问题单：timertask#188、timertask#189、timertask#193、timertask#197、timertask#214。
+
 ## [redis/v0.2.21] — 2026-11-13
 
 - fix: 死信+摘租约 Lua 原子面——四路径半失败不再丢任务（timertask#197）。deadLetterAckScript 先死信失败即中止（租约保留重试），死信/租约两 member 分离保 #188/#189 计数口径；RetryExhausted 失败不置 terminal。
