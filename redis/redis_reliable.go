@@ -86,6 +86,76 @@ func (b *RedisBackend) processingKey() string {
 	return fmt.Sprintf(processingKeyPattern, b.buzType)
 }
 
+// deadLetterAckScript 原子「死信 ZAdd + 摘租约」（#197）：先写死信 ZSet
+// （失败即中止，后续命令不执行），成功后裁剪并摘 processing 租约。
+//
+// 与 requeueLeaseScript 同一服务端原子纪律（#157）：四条「死信 + Ack」
+// 此前是两条独立往返——死信写入被 bestEffortRedis 吞错后 Ack 照常执行，
+// 毒丸/耗尽任务从 processing 摘除后三处皆无（不在分片、不在 processing、
+// 不在死信），at-least-once「不容忍丢失」与「重试耗尽进持久死信」双双
+// 击穿。脚本内出错中止的两个半失败腿都不丢：
+//   - ZAdd 失败 ⇒ ZRem 不执行，租约保留、下轮回扫重试死信写入；
+//   - ZAdd 成功后 ZRem 失败 ⇒ 任务暂留死信与 processing 两处，下轮回扫
+//     重复死信（条目重复可接受）再摘，收敛不丢。
+//
+// KEYS[1]=dead letter zset, KEYS[2]=processing
+// ARGV[1]=deadMember（死信条目字节）, ARGV[2]=score (unix sec),
+// ARGV[3]=maxLen, ARGV[4]=leaseMember（processing 摘除用的原始字节）
+//
+// 两 member 刻意分开：耗尽路径的死信条目是 marshal(task)（含真实
+// retry_count，#189「死信不得少报」），而 processing 里存的是字节稳定的
+// 原始 member（#188 不携带真实计数）——混用会把死信退化成计数 0 的裸串。
+var deadLetterAckScript = goredis.NewScript(`
+	redis.call('zadd', KEYS[1], tonumber(ARGV[2]), ARGV[1])
+	redis.call('zremrangebyrank', KEYS[1], 0, -tonumber(ARGV[3]) - 1)
+	redis.call('zrem', KEYS[2], ARGV[4])
+	return 1
+`)
+
+// deadLetterAck 执行死信+摘租约原子脚本；成功后顺手清 retry-count hash
+// 字段（按 leaseMember 解析，毒丸解析不出时跳过——无 ID 可清）。失败返回
+// error：调用方**不得再摘租约**（保留租约等下轮回扫重试），这是 #197 的
+// 核心契约。
+func (b *RedisBackend) deadLetterAck(ctx context.Context, op, deadMember, leaseMember string) error {
+	deadKey := fmt.Sprintf(deadLetterKey, b.buzType)
+	// 限时 best-effort 防黑洞（同 deadLetterWrite 纪律）：超窗放弃并把
+	// error 交回调用方——租约保留、下轮回扫重试，绝不「吞错后照常摘」。
+	err := bestEffortRedisTimeout(op, bestEffortTimeout, func(ctx context.Context) error {
+		return deadLetterAckScript.Run(ctx, b.client,
+			[]string{deadKey, b.processingKey()},
+			deadMember, b.now().Unix(), deadLetterMaxLen, leaseMember).Err()
+	})
+	if err != nil {
+		return err
+	}
+	b.hdelRetryCount(ctx, leaseMember)
+	return nil
+}
+
+// deadLetterTaskAck 是任务形态（非毒丸）路径的收口：死信条目用
+// marshal(task)（含真实 retry_count，#189），摘租约用原始字节（#188）。
+// marshal 失败返回 error——调用方不摘租约（task 是纯数据结构，实际不可达；
+// 即便发生也宁可回扫循环也不静默丢）。
+func (b *RedisBackend) deadLetterTaskAck(ctx context.Context, op string, task *timertask.Task, leaseMember string) error {
+	data, err := json.Marshal(task)
+	if err != nil {
+		log.Error("dead letter marshal failed", "taskID", task.ID, logx.ErrKey, err)
+		return err
+	}
+	return b.deadLetterAck(ctx, op, string(data), leaseMember)
+}
+
+// hdelRetryCount 清理 retry-count hash 字段（ackTask 与 deadLetterAck 共用
+// 收口）；member 解析不出任务时跳过（毒丸无 ID 可清）。
+func (b *RedisBackend) hdelRetryCount(ctx context.Context, member string) {
+	var task timertask.Task
+	if err := json.Unmarshal([]byte(member), &task); err == nil && task.ID != "" {
+		if err := b.client.HDel(ctx, b.retryCountKey(), b.retryCountField(&task)).Err(); err != nil {
+			log.Error("ack HDel retry count failed", "taskID", task.ID, logx.ErrKey, err)
+		}
+	}
+}
+
 // ackTask 在 handler 成功（或终态死信）后删除租约记录，并顺手清掉
 // retry-count hash 字段（#188）：两条终态路径（worker 侧成功/死信、回扫侧
 // 死信）共用本收口，避免孤儿计数残留。毒丸 member 解析不出任务时跳过
@@ -94,12 +164,7 @@ func (b *RedisBackend) ackTask(ctx context.Context, member string) {
 	if err := b.client.ZRem(ctx, b.processingKey(), member).Err(); err != nil {
 		log.Error("ack ZRem failed", "member", member, logx.ErrKey, err)
 	}
-	var task timertask.Task
-	if err := json.Unmarshal([]byte(member), &task); err == nil && task.ID != "" {
-		if err := b.client.HDel(ctx, b.retryCountKey(), b.retryCountField(&task)).Err(); err != nil {
-			log.Error("ack HDel retry count failed", "taskID", task.ID, logx.ErrKey, err)
-		}
-	}
+	b.hdelRetryCount(ctx, member)
 }
 
 // claimTaskWithLease 将到期任务原子移入 processing 租约集。
@@ -206,13 +271,14 @@ func (b *RedisBackend) reapExpiredLeases(ctx context.Context) {
 	for _, member := range members {
 		task := b.parseTask(member)
 		if task == nil {
-			// #175：毒丸租约不能静默丢弃——此前直接摘租约，绕过专为止损
-			// 取证设计的死信 ZSet。原样进死信（score=当前时刻），再摘租约
-			// 止损避免反复回扫。顺序先死信后摘租约：半失败时最坏是死信
-			// 重复条目，不会丢取证材料（与 requeueLeaseScript 的
-			// 「先回投再摘」同一取舍）。
-			b.sendToDeadLetterRaw(member)
-			b.ackTask(ctx, member)
+			// #175：毒丸租约不能静默丢弃——原样进死信再摘租约止损。
+			// #197：死信+摘租约走同一 Lua 原子面——失败时**不摘租约**
+			// （租约保留下轮回扫重试死信写入），此前两独立往返下半失败
+			// 会让毒丸三处皆无（bestEffort 吞错 + Ack 照常）。
+			if err := b.deadLetterAck(ctx, "dead_letter_poison", member, member); err != nil {
+				log.Error("dead letter ack failed, lease kept for retry",
+					"member", member, logx.ErrKey, err)
+			}
 			continue
 		}
 		// 负数 MaxRetry 表示「不重试」，与 worker 侧 processTask 的归一口径
@@ -234,10 +300,15 @@ func (b *RedisBackend) reapExpiredLeases(ctx context.Context) {
 		// 重投（既不进死信、也不停止）——而 worker 侧对同一份任务早就判过
 		// 「执行一次、不重试」了。
 		if task.RetryCount > task.MaxRetry {
-			// 租约重投次数耗尽 → 死信 + Ack（ackTask 顺手清 hash 字段）
+			// 租约重投次数耗尽 → 死信 + 摘租约（#197 原子面）。
+			// 死信失败 ⇒ 租约保留下轮重试；onFailure 只在确认进死信后
+			// 触发（回扫重试成功才回调，不重复不丢失）。
 			log.Error("lease requeue exhausted", "taskID", task.ID, "retryCount", task.RetryCount)
-			b.sendToDeadLetter(task)
-			b.ackTask(ctx, member)
+			if err := b.deadLetterTaskAck(ctx, "dead_letter", task, member); err != nil {
+				log.Error("dead letter ack failed, lease kept for retry",
+					"taskID", task.ID, logx.ErrKey, err)
+				continue
+			}
 			if b.onFailure != nil {
 				b.onFailure(task, fmt.Errorf("lease expired after %d attempts", task.RetryCount))
 			}
