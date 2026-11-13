@@ -2,6 +2,12 @@
 
 由 oekit/timertask v0.2.0 拆分而来（Redis 形态独立成模块）。
 
+## [v0.2.21] — 2026-11-13
+
+- 随本次 train 一并发布（只发嵌套模块，父模块本次不发版）（timertask#197）
+
+关联问题单：timertask#197。
+
 ## [v0.2.20] — 2026-11-12
 
 - 跟随 timertask v0.5.0 发版（release_train 嵌套 train）（timertask#167、timertask#168、timertask#169、timertask#170、timertask#171、timertask#172、timertask#173、timertask#174、timertask#175、timertask#176）
