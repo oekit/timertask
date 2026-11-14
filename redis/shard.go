@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"hash/fnv"
+	mrand "math/rand"
 	"slices"
 	"strconv"
 	"sync"
@@ -57,7 +58,9 @@ func generateClientID() string {
 	b := make([]byte, 8)
 	if _, err := rand.Read(b); err != nil {
 		// 回退：crypto 不可用时用时间戳 + math/rand 保证唯一性，而非 panic
-		binary.BigEndian.PutUint64(b, uint64(time.Now().UnixNano()))
+		//（#237：注释声称两者混合，实现只有时间戳——同纳秒启动的两实例
+		// 会撞 ID。时间戳 ⊕ math/rand 混合。）
+		binary.BigEndian.PutUint64(b, uint64(time.Now().UnixNano())^mrand.Uint64())
 	}
 	return hex.EncodeToString(b)
 }
@@ -94,6 +97,13 @@ func (s *ShardManager) heartbeat(ctx context.Context) {
 		s.mu.Lock()
 		s.myShards = nil
 		s.mu.Unlock()
+		// #238：尽力摘除自己的注册条目——否则条目要等 heartbeatTimeout(5s)
+		// 过期清理，期间其他实例的一致性哈希仍把分片路由给本实例（本实例
+		// 已停消费 ⇒ 分片最长 5s 无人消费）。ZRem 失败回落到超时清理
+		// （写路径故障下尽力而为）。
+		if _, zerr := s.client.ZRem(ctx, key, s.clientID).Result(); zerr != nil {
+			log.Warn("remove own heartbeat entry failed after heartbeat failure (fallback to TTL expiry)", logx.ErrKey, zerr)
+		}
 		return
 	}
 	s.heartbeatOK.Store(true)
