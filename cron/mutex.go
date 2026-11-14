@@ -107,6 +107,11 @@ func NewLocalMutex(clock local.Clock) *LocalMutex {
 // 同键之外的旧租约不会再被触碰，不扫会无界增长；规模 = 触发率 × TTL，
 // 遍历开销可忽略。
 func (m *LocalMutex) TryLock(_ context.Context, key string, ttl time.Duration) (string, error) {
+	// #240：ttl<=0 ⇒ 租约 expires<=now，下一个 TryLock 的惰性清扫立刻把它
+	// 删掉——同键连续两次 TryLock 双双成功，互斥失效。fail-fast 拒绝。
+	if ttl <= 0 {
+		return "", fmt.Errorf("timertask: LocalMutex.TryLock ttl must be positive (got %v)", ttl)
+	}
 	now := m.clock.Now()
 	m.mu.Lock()
 	defer m.mu.Unlock()

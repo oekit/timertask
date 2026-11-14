@@ -70,6 +70,7 @@ type LocalBackend struct {
 	// 本地队列
 	localQueue chan *Task
 	stopChan   chan struct{}
+	workerWG   sync.WaitGroup // in-flight worker 排空等待(#242)
 	stopOnce   sync.Once
 	// started/stopped 是 Start 的状态机（#124）：started 在 Start 入口登记，
 	// stopped 在停机收尾登记，由 b.mu 保护。stopChan 关闭后没有任何路径重建
@@ -195,8 +196,13 @@ func (b *LocalBackend) Start(ctx context.Context) error {
 	gosafe.Go(func() { b.scanLoop(ctx) })
 
 	// 启动本地 Worker 池
+	b.workerWG.Add(b.workers)
 	for range b.workers {
-		gosafe.Go(func() { b.workerLoop(ctx) })
+		wg := &b.workerWG
+		gosafe.Go(func() {
+			defer wg.Done()
+			b.workerLoop(ctx)
+		})
 	}
 
 	<-ctx.Done()
@@ -204,12 +210,28 @@ func (b *LocalBackend) Start(ctx context.Context) error {
 	// Local 侧任务为 at-most-once:localQueue 阻塞中遇停机的任务直接丢弃、
 	// 无回灌(与 Redis 侧 doc 声明的语义对齐,进程存活期内不丢已执行任务)
 	b.stopOnce.Do(func() { close(b.stopChan) })
+	// #242：等 in-flight worker 到任务边界（有界宽限）——at-most-once 语义
+	// 不回灌，但正在执行的任务让它跑完当前这一次（进程随后退出，半途强杀
+	// 由调用方决定）。
+	drainDone := make(chan struct{})
+	go func() {
+		b.workerWG.Wait()
+		close(drainDone)
+	}()
+	select {
+	case <-drainDone:
+	case <-time.After(shutdownDrainGraceLocal):
+	}
 	// #124：登记停机——此后的二次 Start / Send 都显式报错（ErrBackendStopped）。
 	b.mu.Lock()
 	b.stopped = true
 	b.mu.Unlock()
 	return ctx.Err()
 }
+
+// shutdownDrainGraceLocal 是 Local 停机时等 in-flight worker 到任务边界的
+// 有界宽限（#242）：at-most-once 不回灌，但让正在执行的任务跑完当前一次。
+const shutdownDrainGraceLocal = 10 * time.Second
 
 // scanLoop 定期扫描到期任务并推入本地队列。
 func (b *LocalBackend) scanLoop(ctx context.Context) {

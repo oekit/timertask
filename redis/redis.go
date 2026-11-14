@@ -50,6 +50,10 @@ var bestEffortTimeout = 5 * time.Second
 // 用 var 而非 const：测试需要把它调小以在毫秒级内复现「黑洞」场景。
 var requeueShutdownWindow = 5 * time.Second
 
+// shutdownDrainGrace 是停机时等 in-flight worker 到任务边界的有界宽限
+// （#242）：超时后按原路径继续回灌（进程退出后租约由 TTL 兜底）。
+var shutdownDrainGrace = 10 * time.Second
+
 // deleteScript Lua 原子删除脚本（原子 claim 消费到的 task）。
 //
 // 条件: task 实际 score (EndTime) <= ARGV[2] (current scan time) 时删除。
@@ -104,6 +108,7 @@ type RedisBackend struct {
 	localQueue chan *claim
 	stopChan   chan struct{}
 	stopOnce   sync.Once
+	workerWG   sync.WaitGroup // in-flight worker 排空等待(#242)
 	// started/stopped 是 Start 的状态机（#124），语义与 LocalBackend 一致，
 	// 由 mu 保护：stopChan 关闭后不重建，不做状态机的话二次 Start 会拉起一组
 	// 立刻哑火的消费者（本实例消费吞吐静默归零），Start 却阻塞在新 ctx 上
@@ -285,8 +290,13 @@ func (b *RedisBackend) Start(ctx context.Context) error {
 	}
 
 	// 启动本地 Worker 池
+	b.workerWG.Add(b.workers)
 	for range b.workers {
-		async.GoSafe(func() { b.workerLoop(ctx) })
+		wg := &b.workerWG
+		async.GoSafe(func() {
+			defer wg.Done()
+			b.workerLoop(ctx)
+		})
 	}
 
 	<-ctx.Done()
@@ -295,6 +305,21 @@ func (b *RedisBackend) Start(ctx context.Context) error {
 	// 失败、重试全败，从未真正处理的任务被写进死信 ZSet（假死信）。
 	// stopOnce 防二次 Start 重复 close panic（与 LocalBackend 对称）。
 	b.stopOnce.Do(func() { close(b.stopChan) })
+	// #242：等 in-flight worker 到达任务边界（有界宽限）——此前直接回灌，
+	// 正在执行的任务的租约同时被回灌面处理，执行与回灌赛跑：完成前回灌
+	// ⇒ 重启后双跑；完成后的 ack 与回灌竞态。宽限期内 worker 在任务边界
+	// 退出（stopChan 已关），宽限超时仍不退出的按原路径处理（进程退出，
+	// 租约由 TTL 兜底）。
+	drainDone := make(chan struct{})
+	go func() {
+		b.workerWG.Wait()
+		close(drainDone)
+	}()
+	select {
+	case <-drainDone:
+	case <-time.After(shutdownDrainGrace):
+		log.Warn("worker drain grace exceeded on shutdown, proceeding with requeue", "grace", shutdownDrainGrace)
+	}
 	b.requeuePendingOnShutdown()
 	// at-least-once：停机同步补一轮租约回扫（reapLoop 内也会做，这里兜底时序竞态）
 	if b.delivery == timertask.DeliveryAtLeastOnce {

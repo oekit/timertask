@@ -480,6 +480,12 @@ func (s *Scheduler) reconcileOnce(ctx context.Context, listFn func() ([]Plan, er
 // 互斥让位/互斥设施故障是**未执行**（不是任务失败），记台账 + 日志后返回
 // nil——让位是多实例常态（Debug），设施故障是告警面（Error）。
 func (s *Scheduler) fire(ctx context.Context, planID string, at time.Time) error {
+	return s.fireAttempt(ctx, planID, at, 0)
+}
+
+// fireAttempt 带 attempt 计数的触发执行面（#239 接管重试的防环闸）：
+// attempt==0 是正常调度路径；==1 是崩溃接管重试（只重试一次）。
+func (s *Scheduler) fireAttempt(ctx context.Context, planID string, at time.Time, attempt int) error {
 	trigger := at.UTC().Format(time.RFC3339)
 	key := execLockKey(planID, trigger)
 	ttl := s.cfg.budget.LockTTL() // 锁 TTL 预算公式单一出处（RetryBudget）
@@ -511,6 +517,14 @@ func (s *Scheduler) fire(ctx context.Context, planID string, at time.Time) error
 			// 一次的正常形态）。
 			s.recordSkip(ctx, planID, trigger, nil)
 			s.log.Debug("exec slot taken by other instance", "plan", planID, "trigger", trigger)
+			// #239：接管重试（一次性）——「TTL 到期自动可被他实例接管」的
+			// 接管者此前不存在：认领即消费，唯一一次 fire 落空后该触发点
+			// 永久丢失（持有者崩溃形态）。TTL 到期后重试一次；重试前查台账
+			// 防双跑（原持有者正常完成 ⇒ 让位；仍被持 ⇒ 持有者活着且执行
+			// 超预算，RetryBudget 边界 ⇒ 放弃）。
+			if attempt == 0 {
+				s.scheduleTakeoverRetry(ctx, planID, at, ttl)
+			}
 			return nil
 		case merr != nil:
 			// 互斥设施故障：fail-closed 跳过（宁可漏跑一轮可补发，不可双跑）。
@@ -549,6 +563,42 @@ func (s *Scheduler) execSafe(ctx context.Context, planID, trigger string) (err e
 		}
 	}()
 	return s.exec(ctx, planID, trigger)
+}
+
+// takeoverRetryGuard 是接管重试在租约 TTL 之上的等待余量：租约到期语义
+// （TTL 后可接管）与重试时刻之间留出可见性缓冲。
+const takeoverRetryGuard = 2 * time.Second
+
+// scheduleTakeoverRetry 排一次 TTL 后的接管重试（#239，一次性，不递归）。
+// 重试前查运行台账：本触发点已有非 skip 记录（原持有者正常完成）⇒ 不重跑
+// ——租约「保留到 TTL 到期」的防重设计对崩溃与正常完成一视同仁，盲重试
+// 会把已完成的触发双跑。无法核验（外部台账只写不查）⇒ 保守放弃接管
+// （宁可不接管，不可双跑）。
+func (s *Scheduler) scheduleTakeoverRetry(ctx context.Context, planID string, at time.Time, ttl time.Duration) {
+	gosafe.Go(func() {
+		t := time.NewTimer(ttl + takeoverRetryGuard)
+		defer t.Stop()
+		select {
+		case <-t.C:
+		case <-ctx.Done():
+			return
+		}
+		if s.triggerAlreadyRan(planID, at.UTC().Format(time.RFC3339)) {
+			return
+		}
+		_ = s.fireAttempt(ctx, planID, at, 1)
+	})
+}
+
+// triggerAlreadyRan 查内置 MemLedger 是否已有本触发点的**执行**记录
+// （非 skip）。外部 Ledger 只写不查 ⇒ 无法核验时保守返回 true（不重跑）。
+func (s *Scheduler) triggerAlreadyRan(planID, trigger string) bool {
+	for _, rec := range s.mem.RecentFor(planID) {
+		if rec.Trigger == trigger && !rec.Skipped {
+			return true
+		}
+	}
+	return false
 }
 
 // recordSkip 记一条「未执行」台账（让位/故障 fail-closed，见 RunRecord）。
