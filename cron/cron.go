@@ -175,6 +175,9 @@ func New(exec Executor, opts ...CronOption) *Scheduler {
 			Attempts: DefaultBudgetAttempts,
 			Timeout:  DefaultBudgetTimeout,
 			Backoff:  DefaultBudgetBackoff,
+			// timertask#244：显式自解释（Normalized 本会补缺省，但默认值
+			// 面上写全让读者一眼看到四项都参与 LockTTL 公式）。
+			Slack: DefaultBudgetSlack,
 		},
 	}
 	for _, opt := range opts {
