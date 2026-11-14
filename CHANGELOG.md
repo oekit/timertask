@@ -1,3 +1,7 @@
+## [v0.5.5] — 2026-11-14
+
+- fix: 审计批报 5 单——clientID 时间戳⊕math/rand 混合(#237)/心跳失败尽力摘除注册条目(#238)/跨实例租约一次性接管重试带台账防双跑(#239)/LocalMutex ttl<=0 fail-fast(#240)/两后端停机 in-flight 有界排空(#242)(#241 已修已发/#243 契约冲突关单)
+
 ## [v0.5.4] — 2026-11-13
 
 - 租约/死信原子面：回投 member 字节稳定 + retry_count 迁 hash（#188）、RunWithRetry 基线取入参 RetryCount（#189）、日志 err 键根模块单源常量（#193）、死信写入与租约 Ack 原子化防毒丸无痕丢失（#197）、回归假绿修复 + RetryExhausted at-most-once 分支（#214）
