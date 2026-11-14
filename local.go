@@ -70,7 +70,7 @@ type LocalBackend struct {
 	// 本地队列
 	localQueue chan *Task
 	stopChan   chan struct{}
-	workerWG sync.WaitGroup // in-flight worker 排空等待(#242)
+	workerWG   sync.WaitGroup // in-flight worker 排空等待(#242)
 	stopOnce   sync.Once
 	// started/stopped 是 Start 的状态机（#124）：started 在 Start 入口登记，
 	// stopped 在停机收尾登记，由 b.mu 保护。stopChan 关闭后没有任何路径重建
