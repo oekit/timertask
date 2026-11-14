@@ -38,7 +38,7 @@ type RetryBudget struct {
 	// Attempts 总尝试次数（含首次），<1 归一为 1。
 	Attempts int
 	// Timeout 单次尝试（执行 + 尝试内等待）上限，<=0 取 DefaultBudgetTimeout
-	//（零值=缺省，timertask#244——0=无时限曾让 LockTTL 只剩 Slack、租约
+	// （零值=缺省，timertask#244——0=无时限曾让 LockTTL 只剩 Slack、租约
 	// 先于执行过期致双跑）。
 	Timeout time.Duration
 	// Backoff 相邻尝试间的固定退避，<=0 归 0。
