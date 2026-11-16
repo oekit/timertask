@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sync"
 
+	pkgerrors "github.com/oekit/pkg/errors"
 	"github.com/oekit/pkg/timex/cron"
 
 	"github.com/oekit/timertask/internal/gosafe"
@@ -59,7 +60,7 @@ func (s *Scheduler) ScheduleFor(key, spec string, fn Task) error {
 	}
 	sched, err := s.parseSpec(spec)
 	if err != nil {
-		return fmt.Errorf("local: parse cron %q: %w", spec, err)
+		return pkgerrors.Wrapf(err, "local: parse cron %q", spec)
 	}
 	// 与 Schedule 同一口径（#123）：试算首个触发点，求不出即报错。
 	if err := s.checkSatisfiable(sched); err != nil {
@@ -157,7 +158,7 @@ func (s *Scheduler) Reconcile(entries []Entry) error {
 			return errors.New("local: reconcile: empty key in desired set")
 		}
 		if seen[entries[i].Key] {
-			return fmt.Errorf("local: reconcile: duplicate key %q in desired set", entries[i].Key)
+			return pkgerrors.Newf("local: reconcile: duplicate key %q in desired set", entries[i].Key)
 		}
 		seen[entries[i].Key] = true
 	}
@@ -182,12 +183,12 @@ func (s *Scheduler) Reconcile(entries []Entry) error {
 			continue
 		}
 		if en.Task == nil {
-			errs = append(errs, fmt.Errorf("local: reconcile %q: %w", en.Key, ErrNilTask))
+			errs = append(errs, pkgerrors.Wrapf(ErrNilTask, "local: reconcile %q", en.Key))
 			continue
 		}
 		sched, err := s.parseSpec(en.Spec)
 		if err != nil {
-			errs = append(errs, fmt.Errorf("local: reconcile %q: parse cron %q: %w", en.Key, en.Spec, err))
+			errs = append(errs, pkgerrors.Wrapf(err, "local: reconcile %q: parse cron %q", en.Key, en.Spec))
 			continue
 		}
 		if err := s.checkSatisfiable(sched); err != nil {

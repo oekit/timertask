@@ -12,6 +12,7 @@ import (
 
 	"github.com/oekit/concurrency/async"
 	"github.com/oekit/logx"
+	pkgerrors "github.com/oekit/pkg/errors"
 	"github.com/oekit/timertask"
 	goredis "github.com/redis/go-redis/v9"
 )
@@ -201,7 +202,7 @@ func (b *RedisBackend) Send(ctx context.Context, task *timertask.Task) error {
 		Member: string(data),
 	}).Result()
 	if err != nil {
-		return fmt.Errorf("timertask: ZADD %s: %w", key, err)
+		return pkgerrors.Wrapf(err, "timertask: ZADD %s", key)
 	}
 	log.Info("task scheduled", "taskID", task.ID, "endTime", task.EndTime)
 	return nil
@@ -232,7 +233,7 @@ func (b *RedisBackend) Remove(ctx context.Context, taskID string, endTS int64) (
 		Max: strconv.FormatInt(endTS, 10),
 	}).Result()
 	if err != nil {
-		return 0, fmt.Errorf("timertask: ZRANGEBYSCORE %s: %w", key, err)
+		return 0, pkgerrors.Wrapf(err, "timertask: ZRANGEBYSCORE %s", key)
 	}
 	var removed int64
 	for _, m := range members {
@@ -242,7 +243,7 @@ func (b *RedisBackend) Remove(ctx context.Context, taskID string, endTS int64) (
 		}
 		n, err := b.client.ZRem(ctx, key, m).Result()
 		if err != nil {
-			return removed, fmt.Errorf("timertask: ZREM %s: %w", key, err)
+			return removed, pkgerrors.Wrapf(err, "timertask: ZREM %s", key)
 		}
 		removed += n
 	}
@@ -842,7 +843,7 @@ func (b *RedisBackend) canonicalMember(t *timertask.Task) (string, error) {
 	c.RetryCount = 0
 	data, err := json.Marshal(&c)
 	if err != nil {
-		return "", fmt.Errorf("timertask: marshal task: %w", err)
+		return "", pkgerrors.Wrapf(err, "timertask: marshal task")
 	}
 	return string(data), nil
 }
@@ -853,7 +854,7 @@ func (b *RedisBackend) PendingCount(ctx context.Context) (int64, error) {
 	for i := range b.buckets {
 		count, err := b.client.ZCard(ctx, b.shardKey(i)).Result()
 		if err != nil {
-			return total, fmt.Errorf("pending count shard %d: %w", i, err)
+			return total, pkgerrors.Wrapf(err, "pending count shard %d", i)
 		}
 		total += count
 	}
