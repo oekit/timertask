@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/oekit/logx"
+	pkgerrors "github.com/oekit/pkg/errors"
 	"github.com/oekit/timertask"
 	goredis "github.com/redis/go-redis/v9"
 )
@@ -310,7 +311,7 @@ func (b *RedisBackend) reapExpiredLeases(ctx context.Context) {
 				continue
 			}
 			if b.onFailure != nil {
-				b.onFailure(task, fmt.Errorf("lease expired after %d attempts", task.RetryCount))
+				b.onFailure(task, pkgerrors.Newf("lease expired after %d attempts", task.RetryCount))
 			}
 			continue
 		}
