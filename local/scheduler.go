@@ -145,7 +145,7 @@ func New(cfg Config) (*Scheduler, error) {
 	switch cfg.CatchUp {
 	case CatchUpSkip, CatchUpAll:
 	default:
-		return nil, fmt.Errorf("local: invalid catch-up policy %d", int(cfg.CatchUp))
+		return nil, pkgerrors.Newf("local: invalid catch-up policy %d", int(cfg.CatchUp))
 	}
 	if cfg.Concurrency <= 0 {
 		cfg.Concurrency = defaultConcurrency
@@ -190,7 +190,7 @@ func (s *Scheduler) Schedule(spec string, fn Task) error {
 	}
 	sched, err := s.parseSpec(spec)
 	if err != nil {
-		return fmt.Errorf("local: parse cron %q: %w", spec, err)
+		return pkgerrors.Wrapf(err, "local: parse cron %q", spec)
 	}
 	// #123：可满足性校验。SpecSchedule.Next 对不可满足表达式静默返回零值，
 	// 调度器消费前必须兜住（见 ErrUnsatisfiableSpec）。
@@ -490,7 +490,7 @@ func (s *Scheduler) checkSatisfiable(sched cron.Schedule) error {
 func (s *Scheduler) invoke(ctx context.Context, e *entry, at time.Time) (err error) {
 	defer func() {
 		if perr := pkgerrors.Recovered(recover()); perr != nil {
-			err = fmt.Errorf("task panic: %w", perr)
+			err = pkgerrors.Wrapf(perr, "task panic")
 		}
 	}()
 	return e.task(ctx, at)

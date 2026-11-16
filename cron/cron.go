@@ -3,7 +3,6 @@ package cron
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log/slog"
 	"os"
 	"sync"
@@ -267,7 +266,7 @@ func (s *Scheduler) Reconcile(ctx context.Context, plans []Plan) error {
 			return errors.New("cron: reconcile: empty plan ID in desired set")
 		}
 		if seen[plans[i].ID] {
-			return fmt.Errorf("cron: reconcile: duplicate plan ID %q in desired set", plans[i].ID)
+			return pkgerrors.Newf("cron: reconcile: duplicate plan ID %q in desired set", plans[i].ID)
 		}
 		seen[plans[i].ID] = true
 	}
@@ -288,7 +287,7 @@ func (s *Scheduler) Reconcile(ctx context.Context, plans []Plan) error {
 			continue
 		}
 		if err := s.install(ctx, p); err != nil {
-			errs = append(errs, fmt.Errorf("cron: reconcile %q: %w", p.ID, err))
+			errs = append(errs, pkgerrors.Wrapf(err, "cron: reconcile %q", p.ID))
 		}
 	}
 	// 已装但不在期望集：注销（期望集是唯一事实源）。
@@ -450,7 +449,7 @@ func (s *Scheduler) install(_ context.Context, p Plan) error {
 			delete(s.plans, p.ID)
 			s.mu.Unlock()
 		}
-		return fmt.Errorf("install %q: %w", p.ID, err)
+		return pkgerrors.Wrapf(err, "install %q", p.ID)
 	}
 	s.mu.Lock()
 	s.plans[p.ID] = &planState{spec: p.Spec, fingerprint: fp}
@@ -562,7 +561,7 @@ func (s *Scheduler) fireAttempt(ctx context.Context, planID string, at time.Time
 func (s *Scheduler) execSafe(ctx context.Context, planID, trigger string) (err error) {
 	defer func() {
 		if perr := pkgerrors.Recovered(recover()); perr != nil {
-			err = fmt.Errorf("cron: executor panic: %w", perr)
+			err = pkgerrors.Wrapf(perr, "cron: executor panic")
 		}
 	}()
 	return s.exec(ctx, planID, trigger)

@@ -3,11 +3,12 @@ package cron
 import (
 	"context"
 	"errors"
-	"fmt"
 	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	pkgerrors "github.com/oekit/pkg/errors"
 
 	"github.com/oekit/timertask/local"
 )
@@ -110,7 +111,7 @@ func (m *LocalMutex) TryLock(_ context.Context, key string, ttl time.Duration) (
 	// #240：ttl<=0 ⇒ 租约 expires<=now，下一个 TryLock 的惰性清扫立刻把它
 	// 删掉——同键连续两次 TryLock 双双成功，互斥失效。fail-fast 拒绝。
 	if ttl <= 0 {
-		return "", fmt.Errorf("timertask: LocalMutex.TryLock ttl must be positive (got %v)", ttl)
+		return "", pkgerrors.Newf("timertask: LocalMutex.TryLock ttl must be positive (got %v)", ttl)
 	}
 	now := m.clock.Now()
 	m.mu.Lock()
@@ -135,10 +136,10 @@ func (m *LocalMutex) Unlock(_ context.Context, key string, ownerID string) error
 	defer m.mu.Unlock()
 	l, ok := m.leases[key]
 	if !ok {
-		return fmt.Errorf("cron: unlock %q: lock not held", key)
+		return pkgerrors.Newf("cron: unlock %q: lock not held", key)
 	}
 	if l.owner != ownerID {
-		return fmt.Errorf("cron: unlock %q: lock held by %q, not %q", key, l.owner, ownerID)
+		return pkgerrors.Newf("cron: unlock %q: lock held by %q, not %q", key, l.owner, ownerID)
 	}
 	delete(m.leases, key)
 	return nil

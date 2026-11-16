@@ -94,7 +94,7 @@ type Handler func(ctx context.Context, task *Task) error
 func runHandlerSafe(ctx context.Context, handler Handler, task *Task) (err error) {
 	defer func() {
 		if perr := pkgerrors.Recovered(recover()); perr != nil {
-			err = fmt.Errorf("handler panic: %w", perr)
+			err = pkgerrors.Wrapf(perr, "handler panic")
 		}
 	}()
 	return handler(ctx, task)
