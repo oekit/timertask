@@ -576,12 +576,16 @@ const takeoverRetryGuard = 2 * time.Second
 // ——租约「保留到 TTL 到期」的防重设计对崩溃与正常完成一视同仁，盲重试
 // 会把已完成的触发双跑。无法核验（外部台账只写不查）⇒ 保守放弃接管
 // （宁可不接管，不可双跑）。
+//
+// 等待走注入时钟（clock.NewTimer 可停 timer，#174 同款，#259）——旧实现裸
+// time.NewTimer 绕过时钟注入，FakeClock 测试下接管重试走真实时间硬等
+// ttl+guard，不可确定性驱动。
 func (s *Scheduler) scheduleTakeoverRetry(ctx context.Context, planID string, at time.Time, ttl time.Duration) {
 	gosafe.Go(func() {
-		t := time.NewTimer(ttl + takeoverRetryGuard)
-		defer t.Stop()
+		timer := s.cfg.clock.NewTimer(ttl + takeoverRetryGuard)
+		defer timer.Stop()
 		select {
-		case <-t.C:
+		case <-timer.C():
 		case <-ctx.Done():
 			return
 		}
