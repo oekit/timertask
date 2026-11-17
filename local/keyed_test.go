@@ -481,3 +481,133 @@ func TestKeyed_ConcurrentMutation_NoRace(t *testing.T) {
 	stop.Store(true)
 	wg.Wait()
 }
+
+// TestInstallFor_FingerprintDiff_Reinstalls 钉住 #261 的指纹语义下沉：diff =
+// （Spec, 派生指纹）二元组——指纹变化（spec 未变）也摘旧装新（任务函数换成
+// 新注册的、触发基准重置到重装时刻），指纹未变幂等空操作（Task 以首次注册
+// 为准）。cron.Scheduler 的指纹装配自此走本面，无须自持登记簿镜像与
+// forced hack。
+func TestInstallFor_FingerprintDiff_Reinstalls(t *testing.T) {
+	s, clock := newTestScheduler(t, Config{})
+
+	mark := make(chan string, 16)
+	if err := s.InstallFor("k", "@every 10s", "fp1", collectFires(mark, "v1")); err != nil {
+		t.Fatal(err)
+	}
+	start(t, s)
+
+	// T+9（首触发 T+10 之前）：指纹变化 ⇒ 重装，基准重置到 T+9。
+	clock.Advance(9 * time.Second)
+	if err := s.InstallFor("k", "@every 10s", "fp2", collectFires(mark, "v2")); err != nil {
+		t.Fatal(err)
+	}
+	// T+10：旧基准本会触发 v1@10；重装后基准=T+9，下一个点 T+19 ⇒ 不触发。
+	clock.Advance(1 * time.Second)
+	select {
+	case m := <-mark:
+		t.Fatalf("指纹变化重装后旧触发基准未重置：%q（期望静默到 T+19）", m)
+	case <-time.After(200 * time.Millisecond):
+	}
+	// T+19：新任务函数从新基准触发。
+	clock.Advance(9 * time.Second)
+	if got := waitMark(t, mark, 2*time.Second); got != "v2@19" {
+		t.Fatalf("重装后触发标记 = %q，期望 v2@19（新 fn + 新基准）", got)
+	}
+
+	// 同指纹重复安装：幂等空操作——v3 不得替换 v2（Task 以首次注册为准）。
+	if err := s.InstallFor("k", "@every 10s", "fp2", collectFires(mark, "v3")); err != nil {
+		t.Fatalf("同指纹重复安装应幂等成功: %v", err)
+	}
+	clock.Advance(10 * time.Second) // T+29
+	if got := waitMark(t, mark, 2*time.Second); got != "v2@29" {
+		t.Fatalf("指纹未变时 Task 不应被替换：标记 = %q，期望 v2@29", got)
+	}
+}
+
+// TestInstallFor_FailureKeepsOldRegistration 钉住重装的原子性（forced hack
+// 移除后的正确性支柱，#261）：spec 解析失败 / 不可满足 / nil Task 的安装
+// 失败发生在任何变更之前——既有注册原样保留（旧 spec、旧 fn、旧基准），
+// 不存在「摘了装不上」的中间态。
+func TestInstallFor_FailureKeepsOldRegistration(t *testing.T) {
+	s, clock := newTestScheduler(t, Config{})
+
+	mark := make(chan string, 8)
+	if err := s.InstallFor("k", "@every 10s", "fp1", collectFires(mark, "keep")); err != nil {
+		t.Fatal(err)
+	}
+	start(t, s)
+
+	if err := s.InstallFor("k", "not a cron", "fp2", collectFires(mark, "x")); err == nil {
+		t.Error("坏 spec 应报错")
+	}
+	if err := s.InstallFor("k", "0 0 31 2 *", "fp2", collectFires(mark, "x")); !errors.Is(err, ErrUnsatisfiableSpec) {
+		t.Errorf("不可满足 spec 应返回 ErrUnsatisfiableSpec，got %v", err)
+	}
+	if err := s.InstallFor("k", "@every 5s", "fp2", nil); !errors.Is(err, ErrNilTask) {
+		t.Errorf("需要重装而 fn 为 nil 应返回 ErrNilTask，got %v", err)
+	}
+	// 三次失败都不动既有注册：k 仍按旧 spec、旧 fn 触发（基准未重置）。
+	clock.Advance(10 * time.Second)
+	if got := waitMark(t, mark, 2*time.Second); got != "keep@10" {
+		t.Fatalf("失败安装动了既有注册：标记 = %q，期望 keep@10", got)
+	}
+	if keys := s.InstalledKeys(); len(keys) != 1 || keys[0] != "k" {
+		t.Fatalf("InstalledKeys = %v, want [k]", keys)
+	}
+}
+
+// TestReconcile_EntryFingerprint 钉住 Reconcile 的 Entry.Fingerprint 语义
+// （#261）：diff =（Spec, Fingerprint）二元组——spec 变而指纹未变（调用方
+// 忘了 bump）也按「期望集是唯一事实源」收敛到新 spec；指纹未变幂等空操作。
+func TestReconcile_EntryFingerprint(t *testing.T) {
+	s, clock := newTestScheduler(t, Config{})
+
+	mark := make(chan string, 16)
+	if err := s.ScheduleFor("a", "@every 5s", collectFires(mark, "a1")); err != nil {
+		t.Fatal(err)
+	}
+	start(t, s)
+
+	clock.Advance(5 * time.Second)
+	if got := waitMark(t, mark, 2*time.Second); got != "a1@5" {
+		t.Fatalf("首次触发 = %q，期望 a1@5", got)
+	}
+
+	// spec 变化、指纹未变：仍收敛到期望 spec（重装，基准 T+5 ⇒ 下一点 T+11）。
+	if err := s.Reconcile([]Entry{
+		{Key: "a", Spec: "@every 6s", Fingerprint: "fp1", Task: collectFires(mark, "a2")},
+	}); err != nil {
+		t.Fatalf("Reconcile(spec 变): %v", err)
+	}
+	clock.Advance(5 * time.Second) // T+10：旧 spec 本会触发
+	select {
+	case m := <-mark:
+		t.Fatalf("spec 变更后旧 spec 仍触发：%q（期望收敛到 @every 6s）", m)
+	case <-time.After(200 * time.Millisecond):
+	}
+	clock.Advance(1 * time.Second) // T+11
+	if got := waitMark(t, mark, 2*time.Second); got != "a2@11" {
+		t.Fatalf("标记 = %q，期望 a2@11（新 spec + 新 fn）", got)
+	}
+
+	// 指纹未变：幂等空操作（fn 以首次注册为准）；指纹变化：重装换 fn。
+	if err := s.Reconcile([]Entry{
+		{Key: "a", Spec: "@every 6s", Fingerprint: "fp1", Task: collectFires(mark, "ghost")},
+	}); err != nil {
+		t.Fatalf("Reconcile(幂等): %v", err)
+	}
+	if err := s.Reconcile([]Entry{
+		{Key: "a", Spec: "@every 6s", Fingerprint: "fp2", Task: collectFires(mark, "a3")},
+	}); err != nil {
+		t.Fatalf("Reconcile(指纹变): %v", err)
+	}
+	clock.Advance(6 * time.Second) // T+17（基准 T+11 + 6s）
+	if got := waitMark(t, mark, 2*time.Second); got != "a3@17" {
+		t.Fatalf("标记 = %q，期望 a3@17（指纹变化重装换 fn、基准未因幂等轮后移）", got)
+	}
+	select {
+	case m := <-mark:
+		t.Fatalf("指纹未变轮不应重装：%q", m)
+	default:
+	}
+}

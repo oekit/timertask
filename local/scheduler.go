@@ -552,6 +552,10 @@ type entry struct {
 	task     Task
 	// key 是业务键形态（#129）的注册键；spec 键形态为空串。
 	key string
+	// fingerprint 是业务键形态的 diff 指纹（#261）：派生规则 = 调用方指纹
+	// 留空取 spec（见 Entry.Fingerprint / InstallFor）。spec 键形态不参与
+	// keyed diff（ErrDuplicateSpec 防呆），恒为零值。
+	fingerprint string
 
 	mu       sync.Mutex
 	cond     *sync.Cond
