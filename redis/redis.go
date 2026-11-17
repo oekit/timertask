@@ -148,8 +148,9 @@ func NewRedisBackend(buzType string, client goredis.UniversalClient, handler tim
 		stopChan:          make(chan struct{}),
 	}
 
-	// 创建分片管理器
-	b.shardManager = NewShardManager(buzType, client, b.buckets)
+	// 创建分片管理器（#260：WithClock 经同一配置面下发到分片面——心跳
+	// 时间戳与过期清理阈值与任务时间判断同源走注入时钟）
+	b.shardManager = NewShardManager(buzType, client, b.buckets, WithShardClock(cfg.Clock))
 
 	return b
 }
