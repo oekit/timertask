@@ -1,3 +1,9 @@
+## [v0.5.7] — 2026-11-18
+
+- cron scheduleTakeoverRetry 等待走注入时钟 clock.NewTimer,#239 接管重试 FakeClock 下可确定性驱动(#259);nil-ctx 兜底收敛 contextx.OrBackground
+
+关联问题单：timertask#259。
+
 ## [v0.5.6] — 2026-11-16
 
 - refactor: fmt.Errorf → oekit/pkg/errors 三形态对位替换（#520 替换波）+ 依赖地板抬至各依赖最新已发布版本（pkg v0.52.0）
