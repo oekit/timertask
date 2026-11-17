@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/oekit/pkg/contextx"
 	pkgerrors "github.com/oekit/pkg/errors"
 	"github.com/oekit/pkg/timex/cron"
 
@@ -431,9 +432,8 @@ func (s *Scheduler) execute(e *entry, at time.Time) {
 	s.mu.Lock()
 	ctx := s.taskCtx
 	s.mu.Unlock()
-	if ctx == nil {
-		ctx = context.Background()
-	}
+	// 口径单源：pkg/contextx.OrBackground。
+	ctx = contextx.OrBackground(ctx)
 
 	// sem 阻塞可被 stopCh 唤醒（#79）：此前 execute 只监听 sem 与 Start 传入的
 	// ctx——Start 用不可取消 ctx（生产常态）时，配额占满后到达的任务阻塞在
