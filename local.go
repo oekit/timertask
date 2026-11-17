@@ -72,13 +72,13 @@ type LocalBackend struct {
 	stopChan   chan struct{}
 	workerWG   sync.WaitGroup // in-flight worker 排空等待(#242)
 	stopOnce   sync.Once
-	// started/stopped 是 Start 的状态机（#124）：started 在 Start 入口登记，
-	// stopped 在停机收尾登记，由 b.mu 保护。stopChan 关闭后没有任何路径重建
-	// 它——若不做状态机，二次 Start 拉起的 goroutine 会全部立刻命中已关闭的
-	// stopChan 退出（哑火），任务照常入堆但零消费，是比 panic 更隐蔽的静默
-	// 失效。状态机让「第二次 Start」要么报错、要么（首次）真的开始消费。
-	started bool
-	stopped bool
+	// st 是 Start 的状态机（#124，检查面单源 timertask.StartState，#262）：
+	// started 在 Start 入口登记，stopped 在停机收尾登记，由 b.mu 保护。
+	// stopChan 关闭后没有任何路径重建它——若不做状态机，二次 Start 拉起的
+	// goroutine 会全部立刻命中已关闭的 stopChan 退出（哑火），任务照常入堆
+	// 但零消费，是比 panic 更隐蔽的静默失效。状态机让「第二次 Start」要么
+	// 报错、要么（首次）真的开始消费。
+	st StartState
 }
 
 // NewLocalBackend 创建基于内存的本地延迟任务后端。
@@ -142,7 +142,7 @@ func (b *LocalBackend) Send(ctx context.Context, task *Task) error {
 	defer b.mu.Unlock()
 
 	// #124：停机后拒绝新任务（见 Send 注释的任务不入堆条目）。
-	if b.stopped {
+	if b.st.StoppedLocked() {
 		return ErrBackendStopped
 	}
 
@@ -177,19 +177,15 @@ func (b *LocalBackend) Send(ctx context.Context, task *Task) error {
 // started 错误），不会像旧实现那样拉起一组因 stopChan 已关闭而立刻退出的
 // 哑火 goroutine。需要重启任务消费请重建实例。
 func (b *LocalBackend) Start(ctx context.Context) error {
-	// #124 状态机：入口先做状态检查并登记 started（与 Send/PendingCount 共用
-	// b.mu）。检查必须在拉起 goroutine 之前，否则二次调用同样会拉起一组必然
-	// 哑火的消费者。
+	// #124 状态机：入口先做状态检查并登记 started（三态检查单源
+	// timertask.StartState.BeginStartLocked，#262；与 Send/PendingCount 共用
+	// b.mu）。检查必须在拉起 goroutine 之前，否则二次调用同样会拉起一组
+	// 必然哑火的消费者。
 	b.mu.Lock()
-	if b.stopped {
+	if err := b.st.BeginStartLocked(); err != nil {
 		b.mu.Unlock()
-		return ErrBackendStopped
+		return err
 	}
-	if b.started {
-		b.mu.Unlock()
-		return ErrBackendAlreadyStarted
-	}
-	b.started = true
 	b.mu.Unlock()
 
 	// 启动扫描器
@@ -212,26 +208,14 @@ func (b *LocalBackend) Start(ctx context.Context) error {
 	b.stopOnce.Do(func() { close(b.stopChan) })
 	// #242：等 in-flight worker 到任务边界（有界宽限）——at-most-once 语义
 	// 不回灌，但正在执行的任务让它跑完当前这一次（进程随后退出，半途强杀
-	// 由调用方决定）。
-	drainDone := make(chan struct{})
-	go func() {
-		b.workerWG.Wait()
-		close(drainDone)
-	}()
-	select {
-	case <-drainDone:
-	case <-time.After(shutdownDrainGraceLocal):
-	}
+	// 由调用方决定）。排水骨架单源 timertask.DrainWorkers（#262）。
+	DrainWorkers(&b.workerWG, DefaultShutdownDrainGrace)
 	// #124：登记停机——此后的二次 Start / Send 都显式报错（ErrBackendStopped）。
 	b.mu.Lock()
-	b.stopped = true
+	b.st.MarkStoppedLocked()
 	b.mu.Unlock()
 	return ctx.Err()
 }
-
-// shutdownDrainGraceLocal 是 Local 停机时等 in-flight worker 到任务边界的
-// 有界宽限（#242）：at-most-once 不回灌，但让正在执行的任务跑完当前一次。
-const shutdownDrainGraceLocal = 10 * time.Second
 
 // scanLoop 定期扫描到期任务并推入本地队列。
 func (b *LocalBackend) scanLoop(ctx context.Context) {

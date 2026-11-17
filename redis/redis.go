@@ -51,10 +51,6 @@ var bestEffortTimeout = 5 * time.Second
 // 用 var 而非 const：测试需要把它调小以在毫秒级内复现「黑洞」场景。
 var requeueShutdownWindow = 5 * time.Second
 
-// shutdownDrainGrace 是停机时等 in-flight worker 到任务边界的有界宽限
-// （#242）：超时后按原路径继续回灌（进程退出后租约由 TTL 兜底）。
-var shutdownDrainGrace = 10 * time.Second
-
 // deleteScript Lua 原子删除脚本（原子 claim 消费到的 task）。
 //
 // 条件: task 实际 score (EndTime) <= ARGV[2] (current scan time) 时删除。
@@ -110,13 +106,13 @@ type RedisBackend struct {
 	stopChan   chan struct{}
 	stopOnce   sync.Once
 	workerWG   sync.WaitGroup // in-flight worker 排空等待(#242)
-	// started/stopped 是 Start 的状态机（#124），语义与 LocalBackend 一致，
-	// 由 mu 保护：stopChan 关闭后不重建，不做状态机的话二次 Start 会拉起一组
-	// 立刻哑火的消费者（本实例消费吞吐静默归零），Start 却阻塞在新 ctx 上
-	// 看起来健康。状态机让「第二次 Start」要么报错、要么（首次）真的开始消费。
-	mu      sync.Mutex
-	started bool
-	stopped bool
+	// st 是 Start 的状态机（#124），语义与 LocalBackend 一致，检查面单源
+	// timertask.StartState（#262），由 mu 保护：stopChan 关闭后不重建，不做
+	// 状态机的话二次 Start 会拉起一组立刻哑火的消费者（本实例消费吞吐静默
+	// 归零），Start 却阻塞在新 ctx 上看起来健康。状态机让「第二次 Start」
+	// 要么报错、要么（首次）真的开始消费。
+	mu sync.Mutex
+	st timertask.StartState
 }
 
 // claim 是本地队列中的已 claim 任务，member 为 ZSet 原始成员串。
@@ -184,7 +180,7 @@ func (b *RedisBackend) Send(ctx context.Context, task *timertask.Task) error {
 		return timertask.ErrEmptyTaskID
 	}
 	b.mu.Lock()
-	stopped := b.stopped
+	stopped := b.st.StoppedLocked()
 	b.mu.Unlock()
 	if stopped {
 		return timertask.ErrBackendStopped
@@ -262,19 +258,15 @@ func (b *RedisBackend) Remove(ctx context.Context, taskID string, endTS int64) (
 // already started 错误），不会像旧实现那样拉起一组因 stopChan 已关闭而
 // 立刻退出的哑火 goroutine。需要重启任务消费请重建实例。
 func (b *RedisBackend) Start(ctx context.Context) error {
-	// #124 状态机：入口先做状态检查并登记 started。检查必须在拉起 goroutine
+	// #124 状态机：入口先做状态检查并登记 started（三态检查单源
+	// timertask.StartState.BeginStartLocked，#262）。检查必须在拉起 goroutine
 	// 之前，否则二次调用同样会拉起一组必然哑火的消费者。
 	b.mu.Lock()
-	if b.stopped {
-		b.mu.Unlock()
-		return timertask.ErrBackendStopped
-	}
-	if b.started {
-		b.mu.Unlock()
+	if err := b.st.BeginStartLocked(); err != nil {
 		// already-started 哨兵单源（#169）：根包导出的 timertask.ErrBackendAlreadyStarted。
-		return timertask.ErrBackendAlreadyStarted
+		b.mu.Unlock()
+		return err
 	}
-	b.started = true
 	b.mu.Unlock()
 
 	// 启动心跳
@@ -311,16 +303,10 @@ func (b *RedisBackend) Start(ctx context.Context) error {
 	// 正在执行的任务的租约同时被回灌面处理，执行与回灌赛跑：完成前回灌
 	// ⇒ 重启后双跑；完成后的 ack 与回灌竞态。宽限期内 worker 在任务边界
 	// 退出（stopChan 已关），宽限超时仍不退出的按原路径处理（进程退出，
-	// 租约由 TTL 兜底）。
-	drainDone := make(chan struct{})
-	go func() {
-		b.workerWG.Wait()
-		close(drainDone)
-	}()
-	select {
-	case <-drainDone:
-	case <-time.After(shutdownDrainGrace):
-		log.Warn("worker drain grace exceeded on shutdown, proceeding with requeue", "grace", shutdownDrainGrace)
+	// 租约由 TTL 兜底）。排水骨架单源 timertask.DrainWorkers（#262），
+	// 宽限预算单源 timertask.DefaultShutdownDrainGrace。
+	if !timertask.DrainWorkers(&b.workerWG, timertask.DefaultShutdownDrainGrace) {
+		log.Warn("worker drain grace exceeded on shutdown, proceeding with requeue", "grace", timertask.DefaultShutdownDrainGrace)
 	}
 	b.requeuePendingOnShutdown()
 	// at-least-once：停机同步补一轮租约回扫（reapLoop 内也会做，这里兜底时序竞态）
@@ -330,7 +316,7 @@ func (b *RedisBackend) Start(ctx context.Context) error {
 	// #124：停机收尾完成后登记 stopped——此后的二次 Start / Send 都显式报错
 	// （timertask.ErrBackendStopped）。
 	b.mu.Lock()
-	b.stopped = true
+	b.st.MarkStoppedLocked()
 	b.mu.Unlock()
 	return ctx.Err()
 }
