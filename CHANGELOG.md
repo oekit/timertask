@@ -1,3 +1,15 @@
+## [redis/v0.2.22] — 2026-11-18
+
+- redis ShardManager 心跳/过期清理走注入时钟 WithShardClock,#152 时间单源覆盖分片面,假时钟可确定性测试(#260);指纹 diff 下沉 local.Scheduler(Entry.Fingerprint+InstallFor/InstalledKeys),cron 双层登记簿与 forced hack 移除,对账校验单源 internal/reconcile.ValidateDesiredSet(#261);根包导出 StartState/DrainWorkers/DefaultShutdownDrainGrace,Local/Redis 后端生命周期骨架与 10s 常量单源(#262)
+
+关联问题单：timertask#260、timertask#261、timertask#262。
+
+## [v0.5.8] — 2026-11-18
+
+- redis ShardManager 心跳/过期清理走注入时钟 WithShardClock,#152 时间单源覆盖分片面,假时钟可确定性测试(#260);指纹 diff 下沉 local.Scheduler(Entry.Fingerprint+InstallFor/InstalledKeys),cron 双层登记簿与 forced hack 移除,对账校验单源 internal/reconcile.ValidateDesiredSet(#261);根包导出 StartState/DrainWorkers/DefaultShutdownDrainGrace,Local/Redis 后端生命周期骨架与 10s 常量单源(#262)
+
+关联问题单：timertask#260、timertask#261、timertask#262。
+
 ## [v0.5.7] — 2026-11-18
 
 - cron scheduleTakeoverRetry 等待走注入时钟 clock.NewTimer,#239 接管重试 FakeClock 下可确定性驱动(#259);nil-ctx 兜底收敛 contextx.OrBackground

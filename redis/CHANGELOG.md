@@ -2,6 +2,12 @@
 
 由 oekit/timertask v0.2.0 拆分而来（Redis 形态独立成模块）。
 
+## [v0.2.22] — 2026-11-18
+
+- 跟随 timertask v0.5.8 发版（release_train 嵌套 train）（timertask#260、timertask#261、timertask#262）
+
+关联问题单：timertask#260、timertask#261、timertask#262。
+
 ## [v0.2.21] — 2026-11-13
 
 > ⚠️ **勘误（#217）**：本节声称的 timertask#197 修复**实际首发于根 v0.5.4 同 train 携带的 redis 版本线**——本 tag 落点早于修复 PR #209 合入 main（prewrite → tag 顺序劈叉）。按本节定位会落空，以根仓 v0.5.4 节为准。
