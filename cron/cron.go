@@ -13,6 +13,7 @@ import (
 
 	"github.com/oekit/timertask"
 	"github.com/oekit/timertask/internal/gosafe"
+	"github.com/oekit/timertask/internal/reconcile"
 	"github.com/oekit/timertask/local"
 )
 
@@ -122,13 +123,9 @@ func WithCatchUp(p local.CatchUpPolicy) CronOption { return func(o *cronOptions)
 // time.Local）。
 func WithLocation(loc *time.Location) CronOption { return func(o *cronOptions) { o.location = loc } }
 
-// planState 是已装入触发引擎的计划状态（指纹 diff 的本地镜像）。
-type planState struct {
-	spec        string
-	fingerprint string // 归一后的指纹（Plan.Fingerprint 为空时派生 = Spec）
-}
-
 // planFingerprint 返回计划的 diff 指纹（留空派生 = Spec，见 Plan.Fingerprint）。
+// #261：指纹 diff 的登记与判定单源下沉 local.Scheduler.InstallFor——本函数
+// 只负责把 Plan 归一成 local 侧的指纹参数，调度器不再自持登记簿镜像。
 func planFingerprint(p Plan) string {
 	if p.Fingerprint != "" {
 		return p.Fingerprint
@@ -149,8 +146,12 @@ type Scheduler struct {
 	// 与新条目补跑可撞同一 slot，进程内先裁决，不劳分布式锁。
 	slotMu *LocalMutex
 
+	// stopped 是调度器自身的停机终态（#124 实例一次性，由 mu 保护）。
+	// 已装计划的登记簿单源在 inner（local.Scheduler 的 keyed 表，#261）：
+	// 指纹 diff、幂等判定与「已装清单」都从 inner 读——此前 cron 侧自持
+	// 一份 plans 镜像，与 inner 的幂等规则（按 spec）分叉，指纹变了装不上
+	// 只能「先摘后装」forced hack 且摘了装不上要手动回滚。
 	mu      sync.Mutex
-	plans   map[string]*planState
 	stopped bool
 
 	engineCtx       context.Context
@@ -214,7 +215,6 @@ func New(exec Executor, opts ...CronOption) *Scheduler {
 		inner:      inner,
 		mem:        NewMemLedger(cfg.runCapacity),
 		slotMu:     NewLocalMutex(cfg.clock),
-		plans:      make(map[string]*planState),
 		engineDone: make(chan struct{}),
 		stopCh:     make(chan struct{}),
 	}
@@ -253,22 +253,25 @@ func New(exec Executor, opts ...CronOption) *Scheduler {
 //   - 单条失败（坏 spec 等）**不阻断**其余条目收敛，失败逐条汇总进返回
 //     错误（errors.Join）；
 //   - 期望集内 ID 重复 / 空 ID ⇒ 「以哪条为准」存在歧义，fail-closed：
-//     本次调用不做任何变更并返回错误；
+//     本次调用不做任何变更并返回错误（校验块单源
+//     internal/reconcile.ValidateDesiredSet，#261——与 local.Reconcile
+//     同一块判定）；
 //   - 首次调用自动拉起触发引擎（StartReconcile 形态亦然）。
 //
 // errors 全部成功时返回 nil；调用方通常应串行化对账（单 goroutine 周期
 // 触发）——并发调用无数据竞争，但收敛次序不保证。停机后返回
 // ErrSchedulerStopped（实例一次性，#124）。
 func (s *Scheduler) Reconcile(ctx context.Context, plans []Plan) error {
-	seen := make(map[string]bool, len(plans))
+	ids := make([]string, len(plans))
 	for i := range plans {
-		if plans[i].ID == "" {
-			return errors.New("cron: reconcile: empty plan ID in desired set")
-		}
-		if seen[plans[i].ID] {
-			return pkgerrors.Newf("cron: reconcile: duplicate plan ID %q in desired set", plans[i].ID)
-		}
-		seen[plans[i].ID] = true
+		ids[i] = plans[i].ID
+	}
+	if err := reconcile.ValidateDesiredSet("cron", "plan ID", ids); err != nil {
+		return err
+	}
+	seen := make(map[string]bool, len(plans))
+	for _, id := range ids {
+		seen[id] = true
 	}
 
 	s.mu.Lock()
@@ -290,17 +293,12 @@ func (s *Scheduler) Reconcile(ctx context.Context, plans []Plan) error {
 			errs = append(errs, pkgerrors.Wrapf(err, "cron: reconcile %q", p.ID))
 		}
 	}
-	// 已装但不在期望集：注销（期望集是唯一事实源）。
-	s.mu.Lock()
-	vanished := make([]string, 0, len(s.plans))
-	for id := range s.plans {
+	// 已装但不在期望集：注销（期望集是唯一事实源）。已装清单读 inner 的
+	// 登记簿（local.InstalledKeys，#261 单源）——不再自持镜像。
+	for _, id := range s.inner.InstalledKeys() {
 		if !seen[id] {
-			vanished = append(vanished, id)
+			s.Remove(ctx, id)
 		}
-	}
-	s.mu.Unlock()
-	for _, id := range vanished {
-		s.Remove(ctx, id)
 	}
 	return errors.Join(errs...)
 }
@@ -329,11 +327,8 @@ func (s *Scheduler) Upsert(ctx context.Context, p Plan) error {
 
 // Remove 按计划 ID 注销（运行期删），返回是否确实移除了触发条目。正在
 // 执行的触发不打断（执行已进台账），未开始的触发丢弃（local.UnscheduleFor
-// 同语义）。
+// 同语义）。#261：登记簿单源 inner——直接按 ID 注销，无须先擦自身镜像。
 func (s *Scheduler) Remove(_ context.Context, id string) bool {
-	s.mu.Lock()
-	delete(s.plans, id)
-	s.mu.Unlock()
 	return s.inner.UnscheduleFor(id)
 }
 
@@ -420,40 +415,22 @@ func (s *Scheduler) RunHistory(planID string) []RunRecord {
 	return s.mem.RecentFor(planID)
 }
 
-// install 是单条计划的增量装配（Reconcile/Upsert 共用）：指纹 diff 判定 +
-// local.ScheduleFor 装配。指纹未变零调用（不重置触发基准）；指纹变化且
-// spec 未变时先摘后装强制重置（local.ScheduleFor 按 spec 判幂等会空操作）。
+// install 是单条计划的增量装配（Reconcile/Upsert 共用）：指纹 diff 判定与
+// 装配单源 local.InstallFor（#261）——指纹未变幂等空操作（不重置触发基准），
+// spec 或指纹任一变化摘旧装新。local 侧校验先于任何变更：坏 spec/不可满足
+// 等失败路径的既有注册原样保留，「摘了装不上」不再存在，forced hack（先
+// UnscheduleFor 再 ScheduleFor + 失败手动回滚镜像）随之移除。
 func (s *Scheduler) install(_ context.Context, p Plan) error {
-	fp := planFingerprint(p)
 	s.mu.Lock()
-	if s.stopped {
-		s.mu.Unlock()
+	stopped := s.stopped
+	s.mu.Unlock()
+	if stopped {
 		return ErrSchedulerStopped
 	}
-	cur := s.plans[p.ID]
-	if cur != nil && cur.fingerprint == fp {
-		s.mu.Unlock()
-		return nil // 指纹未变：幂等空操作（防 @every 被周期重装重置触发点）
-	}
-	forced := cur != nil && cur.spec == p.Spec
-	s.mu.Unlock()
-
 	fn := func(ctx context.Context, at time.Time) error { return s.fire(ctx, p.ID, at) }
-	if forced {
-		s.inner.UnscheduleFor(p.ID)
-	}
-	if err := s.inner.ScheduleFor(p.ID, p.Spec, fn); err != nil {
-		if forced {
-			// 摘了没装上：状态与实际一致（未装），下轮对账重试。
-			s.mu.Lock()
-			delete(s.plans, p.ID)
-			s.mu.Unlock()
-		}
+	if err := s.inner.InstallFor(p.ID, p.Spec, planFingerprint(p), fn); err != nil {
 		return pkgerrors.Wrapf(err, "install %q", p.ID)
 	}
-	s.mu.Lock()
-	s.plans[p.ID] = &planState{spec: p.Spec, fingerprint: fp}
-	s.mu.Unlock()
 	return nil
 }
 
