@@ -6,8 +6,8 @@ require (
 	github.com/alicebob/miniredis/v2 v2.40.0
 	github.com/oekit/concurrency v0.39.0
 	github.com/oekit/logx v0.12.0
-	github.com/oekit/pkg v0.53.0
-	github.com/oekit/timertask v0.5.6
+	github.com/oekit/pkg v0.54.0
+	github.com/oekit/timertask v0.5.7
 	github.com/redis/go-redis/v9 v9.23.0
 )
 
