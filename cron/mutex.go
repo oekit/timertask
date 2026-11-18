@@ -80,6 +80,8 @@ func execLockKey(planID, trigger string) string {
 //     跨实例仲裁（见 cron_test 的互斥并发场景）。
 //
 // 多实例生产部署请注入分布式实现（redisx/distlock 等，经 Mutex 缝）。
+//
+// 同族骨架见 concurrency keyedTTLRegistry(#363)，跨 module 联动另行评估。
 type LocalMutex struct {
 	clock  local.Clock
 	mu     sync.Mutex
