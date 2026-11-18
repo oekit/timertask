@@ -1,3 +1,9 @@
+## [v0.5.10] — 2026-11-19
+
+- - fix: requeueClaim 停机回投改走 canonicalMember——第三条 member 写入面此前用裸 json.Marshal(task)，中断路径改写的 RetryCount 会让回投 member 与 canonical 字节分叉：at-most-once 下 ZAdd 变新增条目，业务同拍幂等重发即双 member 双跑（#76/#188 钉死的「同拍重发=同 member」不变量修复）；附 member 字节稳定性回归测试（#279）
+
+关联问题单：timertask#279。
+
 ## [v0.5.9] — 2026-11-18
 
 - docs: cron LocalMutex 注明同族骨架 concurrency keyedTTLRegistry(#363) 跨 module 联动边界;地板对齐 concurrency v0.39.1
