@@ -186,8 +186,9 @@ func (b *RedisBackend) Send(ctx context.Context, task *timertask.Task) error {
 		return timertask.ErrBackendStopped
 	}
 	// 规范化 member 单源 canonicalMember（#188）：补 MaxRetry 缺省、钉
-	// CreateTime=EndTime（#75）、RetryCount 归零（#188）——Send 与租约回投
-	// 两条写入面共用同一产出，「同拍重发 = 同 member」自此跨租约周期成立。
+	// CreateTime=EndTime（#75）、RetryCount 归零（#188）——Send 与两条回投
+	// 路径（reapExpiredLeases / requeueClaim）共用同一产出，「同拍重发 =
+	// 同 member」自此跨租约周期成立。
 	data, err := b.canonicalMember(task)
 	if err != nil {
 		return err
@@ -377,7 +378,13 @@ func (b *RedisBackend) requeuePendingOnShutdown() {
 // at-most-once 只有回投单命令，无半失败窗口。
 func (b *RedisBackend) requeueClaim(ctx context.Context, c *claim) bool {
 	task := c.task
-	data, err := json.Marshal(task)
+	// 回投 member 单源 canonicalMember（#279）：c.task 指针在中断路径可能已被
+	// 改写（retry-count hash 基线回写 redis.go:642-644、RunWithRetry 重试推进
+	// retry.go:99），裸 json.Marshal 会产出与 Send 分叉的字节串——at-most-once
+	// 下 ZAdd 变新增条目而非 score 更新，同拍幂等重发即双 member 双跑
+	// （#76/#188 不变量在第三写入面失效）。canonicalMember 对已 canonical
+	// 的 task 幂等，无行为变化。
+	data, err := b.canonicalMember(task)
 	if err != nil {
 		log.Error("requeue marshal failed", "taskID", task.ID, logx.ErrKey, err)
 		return false
@@ -386,7 +393,7 @@ func (b *RedisBackend) requeueClaim(ctx context.Context, c *claim) bool {
 	if b.delivery != timertask.DeliveryAtLeastOnce {
 		if err := b.client.ZAdd(ctx, key, goredis.Z{
 			Score:  float64(task.EndTime),
-			Member: string(data),
+			Member: data,
 		}).Err(); err != nil {
 			log.Error("requeue ZAdd failed", "taskID", task.ID, logx.ErrKey, err)
 			return false
@@ -394,7 +401,7 @@ func (b *RedisBackend) requeueClaim(ctx context.Context, c *claim) bool {
 		return true
 	}
 	if err := requeueLeaseScript.Run(ctx, b.client, []string{key, b.processingKey()},
-		task.EndTime, string(data), c.member).Err(); err != nil {
+		task.EndTime, data, c.member).Err(); err != nil {
 		log.Error("requeue failed", "taskID", task.ID, logx.ErrKey, err)
 		return false
 	}
@@ -813,9 +820,10 @@ func (b *RedisBackend) parseTask(data string) *timertask.Task {
 //   - CreateTime 钉为 EndTime（#75，member 里「创建时刻」不存在）；
 //   - RetryCount 归零（#188）——真实重试计数在 retry-count hash
 //     （redis_reliable.go），member 必须在任务整个生命周期内字节稳定：
-//     Send 与租约到期回投（reapExpiredLeases）两条写入面共用本函数，
-//     「同拍重发 = 同 member」与「回投 member = Send member」自此同一字节串，
-//     生产者 at-least-once 重发命中 ZAdd 的 score 更新而非新增条目。
+//     Send、租约到期回投（reapExpiredLeases）与停机回投（requeueClaim，
+//     #279）三条写入面共用本函数，「同拍重发 = 同 member」与「回投 member =
+//     Send member」自此同一字节串，生产者 at-least-once 重发命中 ZAdd 的
+//     score 更新而非新增条目。
 //
 // 历史格式 member（含非零 retry_count 的旧版本写入）解析不受影响；升级窗口
 // 内「旧 member 未消费 + 新 member 重发」会短暂并存两条（重发与旧条目字节
