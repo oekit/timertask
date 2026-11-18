@@ -1,3 +1,7 @@
+## [v0.5.9] — 2026-11-18
+
+- docs: cron LocalMutex 注明同族骨架 concurrency keyedTTLRegistry(#363) 跨 module 联动边界;地板对齐 concurrency v0.39.1
+
 ## [redis/v0.2.22] — 2026-11-18
 
 - redis ShardManager 心跳/过期清理走注入时钟 WithShardClock,#152 时间单源覆盖分片面,假时钟可确定性测试(#260);指纹 diff 下沉 local.Scheduler(Entry.Fingerprint+InstallFor/InstalledKeys),cron 双层登记簿与 forced hack 移除,对账校验单源 internal/reconcile.ValidateDesiredSet(#261);根包导出 StartState/DrainWorkers/DefaultShutdownDrainGrace,Local/Redis 后端生命周期骨架与 10s 常量单源(#262)
