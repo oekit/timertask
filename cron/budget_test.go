@@ -1,6 +1,7 @@
 package cron
 
 import (
+	"math"
 	"testing"
 	"time"
 )
@@ -62,5 +63,33 @@ func TestRetryBudgetZeroValueTimeoutCoherent(t *testing.T) {
 	explicit := RetryBudget{Attempts: 2, Timeout: 5 * time.Second}
 	if got := explicit.Normalized().Timeout; got != 5*time.Second {
 		t.Fatalf("显式 Timeout 被覆盖: %v", got)
+	}
+}
+
+// timertask#285：TotalBackoff/LockTTL 乘前判溢出、饱和而非回绕为负（对齐
+// concurrency/retry #283 饱和哲学）。此前线性裸乘无上界钳：超大配置回绕成
+// 负退避（静默消灭防线）/负租约（被 #244 防御 panic 误报成「公式破坏」）。
+func TestRetryBudgetOverflowSaturates(t *testing.T) {
+	const maxDur = time.Duration(math.MaxInt64)
+	huge := time.Duration(1) << 62
+
+	// 乘法饱和：Attempts*Backoff / Attempts*Timeout 越界即 MaxInt64
+	b := RetryBudget{Attempts: 1 << 31, Timeout: huge, Backoff: huge, Slack: time.Second}
+	if got := b.TotalBackoff(); got != maxDur {
+		t.Fatalf("TotalBackoff 应饱和到 MaxInt64, got %v", got)
+	}
+	if got := b.LockTTL(); got != maxDur {
+		t.Fatalf("LockTTL 应饱和到 MaxInt64, got %v", got)
+	}
+	// 加法饱和：单项乘积已顶格 + Slack 不得回绕
+	b2 := RetryBudget{Attempts: 1, Timeout: maxDur, Slack: DefaultBudgetSlack}
+	if got := b2.LockTTL(); got != maxDur {
+		t.Fatalf("顶格 Timeout + Slack 应饱和到 MaxInt64, got %v", got)
+	}
+	// 边界不误饱和：乘积恰 ≤ MaxInt64 照常精确计算
+	exact := RetryBudget{Attempts: 2, Backoff: huge}
+	// (2-1)*2^62 = 2^62，MaxInt64/2^62 = 1 ⇒ 不触发护栏
+	if got, want := exact.TotalBackoff(), huge; got != want {
+		t.Fatalf("边界乘积应精确 = %v, got %v", want, got)
 	}
 }

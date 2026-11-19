@@ -1,6 +1,9 @@
 package cron
 
-import "time"
+import (
+	"math"
+	"time"
+)
 
 // 默认重试预算：对齐根包延迟任务的默认量级（WithRetry 默认 3 次 / 5s 间隔、
 // WithVisibilityTimeout 默认 60s 租约），沿用同一族默认值让「锁 TTL 预算」
@@ -62,22 +65,53 @@ func (b RetryBudget) Normalized() RetryBudget {
 	return b
 }
 
+// mulSaturate 计算 attempts*unit，**乘前判溢出**（timertask#285，对齐
+// concurrency/retry #283 的饱和哲学）：线性裸乘对配置无界，超大配置回绕成
+// 负 duration——负退避静默消灭防线，负租约还会被 LockTTL 的 #244 防御
+// panic 误报成「公式破坏」。即将越过 MaxInt64 即饱和到 MaxInt64
+// （≈292 年，远超任何真实预算），不回绕为负。
+func mulSaturate(attempts int, unit time.Duration) time.Duration {
+	if attempts <= 0 || unit <= 0 {
+		return 0
+	}
+	if int64(attempts) > math.MaxInt64/int64(unit) {
+		return math.MaxInt64
+	}
+	return time.Duration(attempts) * unit
+}
+
+// addSaturate 两段时长求和，和溢出饱和到 MaxInt64，不回绕为负
+// （timertask#285：与 mulSaturate 同一哲学，对齐 retry.TotalBackoff 的
+// 求和口径——三段预算相加同样可能越过 MaxInt64）。
+func addSaturate(a, b time.Duration) time.Duration {
+	if a > 0 && b > 0 && a > math.MaxInt64-b {
+		return math.MaxInt64
+	}
+	return a + b
+}
+
 // TotalBackoff 返回全部退避之和 = (Attempts-1)*Backoff（首次与末次之间
-// 共 Attempts-1 个退避间隔）。
+// 共 Attempts-1 个退避间隔）。乘前判溢出，饱和而非回绕（#285）。
 func (b RetryBudget) TotalBackoff() time.Duration {
 	n := b.Normalized()
-	return time.Duration(n.Attempts-1) * n.Backoff
+	return mulSaturate(n.Attempts-1, n.Backoff)
 }
 
 // LockTTL 返回互斥锁的租约时长（唯一出处，见类型注释）：
-// Attempts*Timeout + TotalBackoff() + Slack。
+// Attempts*Timeout + TotalBackoff() + Slack。各项乘/加均判溢出、饱和到
+// MaxInt64 而非回绕（#285）——饱和租约仍满足「租约不先于执行过期」的
+// 公式承诺，回绕成负则租约立即过期、双跑。
 func (b RetryBudget) LockTTL() time.Duration {
 	n := b.Normalized()
-	ttl := time.Duration(n.Attempts)*n.Timeout + n.TotalBackoff() + n.Slack
+	ttl := addSaturate(
+		mulSaturate(n.Attempts, n.Timeout),
+		addSaturate(n.TotalBackoff(), n.Slack),
+	)
 	if ttl <= 0 {
 		// timertask#244 防御：归一化后公式必为正（Attempts>=1、Timeout/
 		// Slack 有正缺省）——ttl<=0 说明公式被后续改动破坏，而 0/负租约
-		// = 租约立即过期 = 双跑，fail fast 好过静默放过。
+		// = 租约立即过期 = 双跑，fail fast 好过静默放过。（#285 起溢出
+		// 走饱和不再产生负 ttl，此护栏只剩「公式被改坏」一种触发方式。）
 		panic("timertask: RetryBudget.LockTTL non-positive after normalize — formula broken")
 	}
 	return ttl

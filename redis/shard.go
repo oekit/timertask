@@ -246,6 +246,11 @@ func (s *ShardManager) heartbeatKey() string {
 }
 
 // simpleHash 使用 FNV-1a 计算哈希，分布更均匀。
+//
+// 这是客户端分配哈希：按「buzType-分片号」把分片派给在线实例（归属面分配）。
+// 与 redis/redis.go taskKey 的任务放置哈希（crc32 按任务 ID 路由分片键，
+// 数据面）**刻意不同函数**——用途不同、不要求同哈希；改动任一前先读另一处，
+// 勿使任务放置与实例分配视图漂移（#285）。
 func simpleHash(s string) uint32 {
 	h := fnv.New32a()
 	h.Write([]byte(s))
