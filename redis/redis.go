@@ -868,6 +868,11 @@ func (b *RedisBackend) taskKey(taskID string) string {
 		// 直接写 `int(crc32.ChecksumIEEE(...)) % b.buckets` 在 32 位平台上
 		// 会按位截断成负数 ⇒ 任务被写进 `{timertask.x}.shard.-3` 这样的 key，
 		// 而消费/回扫只扫 shard.0 … shard.N-1 ⇒ 任务永远不会被执行，也不进死信。
+		//
+		// 放置哈希与 redis/shard.go 的客户端分配哈希刻意不同函数（#285）：
+		// 此处 crc32 按任务 ID 决定任务落进哪个分片键（数据面路由），那边
+		// FNV-1a 按分片标识把分片派给在线实例（归属面分配）——用途不同、
+		// 不要求同哈希。改动任一前先读另一处，勿使任务放置与实例分配视图漂移。
 		shard = shardIndex(crc32.ChecksumIEEE([]byte(taskID)), b.buckets)
 	}
 	return fmt.Sprintf(taskKeyPattern, b.buzType, shard)
