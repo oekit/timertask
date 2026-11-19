@@ -1,3 +1,8 @@
+## [v0.5.11] — 2026-11-20
+
+- fix(cron): budget 乘法补饱和上界钳（mulSaturate/addSaturate，对齐 retry #283 饱和哲学）——超大 Attempts 配置不再理论溢出；负租约防误报「公式破坏」的护栏触发面收窄（#285）
+docs(redis): 放置面 crc32 与分配面 fnv1a 双哈希交叉互注——刻意不同函数、用途不同，改动任一前先读另一处（#285）
+
 ## [v0.5.10] — 2026-11-19
 
 - - fix: requeueClaim 停机回投改走 canonicalMember——第三条 member 写入面此前用裸 json.Marshal(task)，中断路径改写的 RetryCount 会让回投 member 与 canonical 字节分叉：at-most-once 下 ZAdd 变新增条目，业务同拍幂等重发即双 member 双跑（#76/#188 钉死的「同拍重发=同 member」不变量修复）；附 member 字节稳定性回归测试（#279）
