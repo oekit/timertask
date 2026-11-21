@@ -341,7 +341,10 @@ func TestFire_LedgerFanOut(t *testing.T) {
 func TestFire_ExecutorPanicRecorded(t *testing.T) {
 	probe := newExecProbe()
 	probe.panics = true
-	s, clock := newTestScheduler(t, probe.exec)
+	// #292：执行预算默认会重试（FakeClock 下退避 timer 需手动推进），本测试
+	// 只钉 panic 收编，Attempts=1 让失败立刻落台账。
+	s, clock := newTestScheduler(t, probe.exec,
+		WithRetryBudget(RetryBudget{Attempts: 1, Timeout: time.Second, Slack: time.Second}))
 	if err := s.Reconcile(context.Background(), []Plan{{ID: "t1", Spec: "@every 1m", Enabled: true}}); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}

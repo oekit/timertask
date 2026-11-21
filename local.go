@@ -121,9 +121,10 @@ func NewLocalBackend(handler Handler, opts ...TimerTaskOption) *LocalBackend {
 //   - 不改写调用方的 Task（#97）：CreateTime/MaxRetry 的缺省补齐、worker
 //     重试时对 RetryCount 的推进都落在引擎内部的副本上，调用方提交后继续
 //     读/复用自己的 Task 结构不会看到字段被引擎改写。
-//   - 后端停机后（Start 已返回）⇒ 返回 ErrBackendStopped（#124），任务
-//     不入堆——继续入堆会让 PendingCount 持续增长而永无消费，运维会误判
-//     为队列积压。
+//   - 后端停机后（Start 已返回）或停机进行中（Start 已收到停机信号、消费
+//     循环已退出但排水尚未结束）⇒ 返回 ErrBackendStopped（#124/#292），
+//     任务不入堆——继续入堆会让 PendingCount 持续增长而永无消费，运维会误判
+//     为队列积压；停机窗口的「提交成功」是更隐蔽的永久丢失。
 func (b *LocalBackend) Send(ctx context.Context, task *Task) error {
 	if task.ID == "" {
 		return ErrEmptyTaskID
@@ -205,7 +206,20 @@ func (b *LocalBackend) Start(ctx context.Context) error {
 	// stopOnce 防二次 Start 后重复 close panic(2026-09-06 复审加固);
 	// Local 侧任务为 at-most-once:localQueue 阻塞中遇停机的任务直接丢弃、
 	// 无回灌(与 Redis 侧 doc 声明的语义对齐,进程存活期内不丢已执行任务)
-	b.stopOnce.Do(func() { close(b.stopChan) })
+	//
+	// #292：stopping 状态与 close(stopChan) 同一临界段登记。scanLoop 在
+	// stopChan 关闭后退出，但 DrainWorkers 还要等 in-flight worker（最长
+	// DefaultShutdownDrainGrace=10s）；窗口内 Send 若仍只检查 st.stopped
+	// （Start 返回后才置位）会返回 nil 并把任务压进内存堆——停机路径只排水
+	// localQueue，从不处理堆内任务 ⇒ 调用方拿到「提交成功」、任务永久丢失、
+	// PendingCount 却持续显示积压。登记 stopping 后 Send 走既有
+	// ErrBackendStopped 拒绝路径，窗口内不再有假成功。
+	b.stopOnce.Do(func() {
+		b.mu.Lock()
+		b.st.MarkStoppingLocked()
+		close(b.stopChan)
+		b.mu.Unlock()
+	})
 	// #242：等 in-flight worker 到任务边界（有界宽限）——at-most-once 语义
 	// 不回灌，但正在执行的任务让它跑完当前这一次（进程随后退出，半途强杀
 	// 由调用方决定）。排水骨架单源 timertask.DrainWorkers（#262）。

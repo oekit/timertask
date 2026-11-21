@@ -2,6 +2,7 @@ package cron
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -70,18 +71,59 @@ func (m *contendOnceMutex) TryLock(_ context.Context, _ string, _ time.Duration)
 
 func (m *contendOnceMutex) Unlock(_ context.Context, _ string, _ string) error { return nil }
 
+// queryLedger 是外置台账的可查询测试替身（#292）：实现 LedgerQuery，
+// 按 (planID, trigger) 报告是否已有非 skip 执行记录（线程安全，可多实例共享）。
+type queryLedger struct {
+	mu       sync.Mutex
+	recs     []RunRecord
+	queryErr error
+}
+
+func (l *queryLedger) Record(_ context.Context, rec RunRecord) {
+	l.mu.Lock()
+	l.recs = append(l.recs, rec)
+	l.mu.Unlock()
+}
+
+func (l *queryLedger) Ran(_ context.Context, planID, trigger string) (bool, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.queryErr != nil {
+		return false, l.queryErr
+	}
+	for _, rec := range l.recs {
+		if rec.PlanID == planID && rec.Trigger == trigger && !rec.Skipped {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (l *queryLedger) records() []RunRecord {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]RunRecord(nil), l.recs...)
+}
+
 // newTakeoverScheduler 构造接管重试测试的假时钟调度器：probingClock 观测
 // NewTimer 请求时长（#259 注入时钟的断言面），测试退出自动 Close。
-func newTakeoverScheduler(t *testing.T, exec Executor, m Mutex) (*Scheduler, *local.FakeClock, *probingClock) {
+//
+// 缺省注入一个空的 queryLedger（#292）：接管重试要求台账可核验，只写不查
+// 的台账会让重试保守放弃——接管路径的测试需要可查询面；测试可用
+// WithLedger 覆盖成共享台账或只写台账。
+func newTakeoverScheduler(t *testing.T, exec Executor, m Mutex, opts ...CronOption) (*Scheduler, *local.FakeClock, *probingClock) {
 	t.Helper()
 	base := local.NewFakeClock(testEpoch())
 	pc := &probingClock{Clock: base}
-	s := New(exec,
+	baseOpts := make([]CronOption, 0, 5+len(opts))
+	baseOpts = append(baseOpts,
 		WithClock(pc),
 		WithMutex(m),
 		WithRetryBudget(RetryBudget{Attempts: 1, Timeout: time.Second, Slack: time.Second}),
 		WithInstance("test"),
+		WithLedger(&queryLedger{}),
 	)
+	s := New(exec, append(baseOpts, opts...)...)
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
@@ -225,5 +267,157 @@ func TestFire_TakeoverRetry_OnceOnly(t *testing.T) {
 	}
 	if got := len(s.RunHistory("")); got != 2 {
 		t.Fatalf("重试后不得再排接管（一次性）, got %d 条台账", got)
+	}
+}
+
+// TestFire_TakeoverRetry_UnverifiableLedgerAbandons 钉住 #292 的保守面：
+// 外置台账只写不查（未实现 LedgerQuery）⇒ 本实例无记录时无法核验他实例是否
+// 已执行，接管重试必须放弃（宁可不接管，不可双跑）；旧实现无条件按「未执行」
+// 处理，TTL 后重跑已完成的触发点。
+func TestFire_TakeoverRetry_UnverifiableLedgerAbandons(t *testing.T) {
+	probe := newExecProbe()
+	s, clock, pc := newTakeoverScheduler(t, probe.exec, &contendOnceMutex{},
+		WithLedger(chanLedger{ch: make(chan RunRecord, 8)})) // 只写不查
+
+	if err := s.Reconcile(context.Background(), []Plan{{ID: "t1", Spec: "@every 1m", Enabled: true}}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	clock.Advance(time.Minute)
+	if recs := waitRecords(t, s, 1); !recs[0].Skipped {
+		t.Fatalf("让位记录应 Skipped: %+v", recs[0])
+	}
+	waitRetryArmed(t, pc)
+
+	clock.Advance(takeoverRetryTTL + takeoverRetryGuard)
+	select {
+	case got := <-probe.ch:
+		t.Fatalf("台账不可核验时不得接管重跑: %q", got)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if got := len(s.RunHistory("")); got != 1 {
+		t.Fatalf("放弃接管不得新增台账, got %d", got)
+	}
+}
+
+// TestFire_TakeoverRetry_QueryErrorAbandons 台账查询失败同样按无法核验处理
+// （#292）：宁可漏接管一轮（可补发），不可双跑。
+func TestFire_TakeoverRetry_QueryErrorAbandons(t *testing.T) {
+	probe := newExecProbe()
+	led := &queryLedger{queryErr: errors.New("ledger db down")}
+	s, clock, pc := newTakeoverScheduler(t, probe.exec, &contendOnceMutex{}, WithLedger(led))
+
+	if err := s.Reconcile(context.Background(), []Plan{{ID: "t1", Spec: "@every 1m", Enabled: true}}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	clock.Advance(time.Minute)
+	waitRecords(t, s, 1)
+	waitRetryArmed(t, pc)
+
+	clock.Advance(takeoverRetryTTL + takeoverRetryGuard)
+	select {
+	case got := <-probe.ch:
+		t.Fatalf("台账查询失败时不得接管重跑: %q", got)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+// TestFire_TakeoverRetry_ExternalLedgerAlreadyRanNoRerun #292 的核验面：
+// 执行发生在**他实例**（本实例 MemLedger 只有自己的 skip 记录），可查询的
+// 外置台账报告该触发点已执行 ⇒ 接管重试放弃，不双跑。
+func TestFire_TakeoverRetry_ExternalLedgerAlreadyRanNoRerun(t *testing.T) {
+	probe := newExecProbe()
+	led := &queryLedger{}
+	now := testEpoch().Add(time.Minute)
+	led.Record(context.Background(), RunRecord{
+		PlanID:    "t1",
+		Trigger:   "2026-11-11T00:01:00Z",
+		Instance:  "other",
+		StartedAt: now,
+		EndedAt:   now,
+	})
+	s, clock, pc := newTakeoverScheduler(t, probe.exec, &contendOnceMutex{}, WithLedger(led))
+
+	if err := s.Reconcile(context.Background(), []Plan{{ID: "t1", Spec: "@every 1m", Enabled: true}}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	clock.Advance(time.Minute)
+	waitRecords(t, s, 1) // 本实例只有 skip 台账（他实例的执行不在 MemLedger）
+	waitRetryArmed(t, pc)
+
+	clock.Advance(takeoverRetryTTL + takeoverRetryGuard)
+	select {
+	case got := <-probe.ch:
+		t.Fatalf("外置台账已报告执行，不得重跑: %q", got)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+// TestMultiInstance_TakeoverRetry_SharedLedgerPreventsDoubleRun 双实例回归
+// （#292）：A 持有跨实例锁并完成执行，B 让位后按 TTL+guard 排接管重试。
+// B 的本进程 MemLedger 没有 A 的记录（旧实现据此判定「未执行」⇒ 双跑）；
+// 共享的可查询台账报告该触发点已执行 ⇒ B 放弃接管，全场景恰好一次执行。
+func TestMultiInstance_TakeoverRetry_SharedLedgerPreventsDoubleRun(t *testing.T) {
+	clock := local.NewFakeClock(testEpoch())
+	sharedMutex := NewLocalMutex(clock)
+	led := &queryLedger{}
+	var execCount atomic.Int64
+	exec := func(_ context.Context, _, _ string) error {
+		execCount.Add(1)
+		return nil
+	}
+	budget := RetryBudget{Attempts: 1, Timeout: time.Second, Slack: time.Second}
+	newInst := func(name string) *Scheduler {
+		return New(exec,
+			WithClock(clock),
+			WithMutex(sharedMutex),
+			WithLedger(led),
+			WithRetryBudget(budget),
+			WithInstance(name),
+		)
+	}
+	s1, s2 := newInst("i1"), newInst("i2")
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = s1.Close(ctx)
+		_ = s2.Close(ctx)
+	})
+
+	plans := []Plan{{ID: "takeover", Spec: "@every 10m", Fingerprint: "fp1", Enabled: true}}
+	if err := s1.Reconcile(context.Background(), plans); err != nil {
+		t.Fatalf("s1 Reconcile: %v", err)
+	}
+	if err := s2.Reconcile(context.Background(), plans); err != nil {
+		t.Fatalf("s2 Reconcile: %v", err)
+	}
+	clock.Advance(10 * time.Minute) // 两实例同刻触发同一 slot
+
+	if !waitForCond(3*time.Second, func() bool { return len(led.records()) >= 2 }) {
+		t.Fatalf("双实例台账未落地: %+v", led.records())
+	}
+	recs := led.records()
+	var executed, skipped int
+	for _, rec := range recs {
+		if rec.Skipped {
+			skipped++
+		} else {
+			executed++
+		}
+	}
+	if executed != 1 || skipped != 1 {
+		t.Fatalf("恰好一次执行 + 一次让位, got executed=%d skipped=%d (%+v)", executed, skipped, recs)
+	}
+	if got := execCount.Load(); got != 1 {
+		t.Fatalf("首触发应恰好一次执行, got %d", got)
+	}
+
+	// 让位方在 TTL+guard 后的接管重试：共享台账已有 A 的执行记录 ⇒ 放弃。
+	clock.Advance(takeoverRetryTTL + takeoverRetryGuard)
+	time.Sleep(100 * time.Millisecond)
+	if got := execCount.Load(); got != 1 {
+		t.Fatalf("接管重试双跑：execCount = %d, want 1（#292 台账核验失效）", got)
+	}
+	if got := len(led.records()); got != 2 {
+		t.Fatalf("放弃接管不得新增台账, got %d 条", got)
 	}
 }
