@@ -1,3 +1,15 @@
+## [v0.5.12] — 2026-11-21
+
+- 第三轮设计/缺陷审计（2026-11-21）timertask 修复：
+
+- fix: local 后端停机窗口（close stopChan 同临界段）Send 立即 ErrBackendStopped——不再假成功丢任务（#292）
+- fix: redis 后端 Start 停机序改「close→join 消费协程→drain worker→回灌」——claim 已删后的迟到入队丢任务窗口封死（#292）
+- fix: cron 接管重试新增 LedgerQuery 可查询核验——本实例无记录时查外置台账，查不到保守放弃接管（双跑修复）（#292）
+- fix: cron RetryBudget 真正作用于执行（WithTimeout/Attempts/Backoff）——执行超 LockTTL 不再被接管（#292）
+- docs: redis 键布局明写「单 slot 仅逻辑分片」（分片级 hash tag 属键空间 breaking，登记后续窗口）（#292）
+
+关联问题单：timertask#292。
+
 ## [v0.5.11] — 2026-11-20
 
 - fix(cron): budget 乘法补饱和上界钳（mulSaturate/addSaturate，对齐 retry #283 饱和哲学）——超大 Attempts 配置不再理论溢出；负租约防误报「公式破坏」的护栏触发面收窄（#285）
