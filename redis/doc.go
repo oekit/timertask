@@ -33,6 +33,29 @@
 //
 //	func handler(ctx context.Context, task *timertask.Task) error { ... }
 //
+// # 分片与 Redis Cluster（单 slot 逻辑分片，#292）
+//
+// WithBuckets(n) 把任务按 crc32(taskID) 散到 n 个逻辑分片，**但所有键共用
+// 同一个 hash tag `{timertask.<buzType>}`**：
+//
+//	{timertask.<buzType>}.shard.N        分片 ZSet
+//	{timertask.<buzType>}.processing     租约集
+//	{timertask.<buzType>}.retry_count    累计重试计数 hash
+//	{timertask.<buzType>}.dead           死信 ZSet
+//	{timertask.<buzType>}.heartbeat      实例心跳/分片归属 ZSet
+//
+// 因此 Redis Cluster 下同一 buzType 的全部数据落在**同一个 slot**：分片只是
+// 单节点内的逻辑分片（锁/批量扫描粒度、本地队列隔离），不提供跨节点吞吐、
+// 内存与故障域扩展。单 slot 是当前设计的硬边界，选型时按单节点容量规划；
+// 需要跨节点扩展请等待下述 breaking 变更。
+//
+// 把 hash tag 下沉到分片粒度（`{timertask.<buzType>.shard.N}`）需要把
+// processing/retry_count/dead 一并改成按分片键（claim/回投/死信 Ack 的 Lua
+// 脚本要求同 slot 原子性），这是**键空间 breaking 变更**：升级后旧键对新
+// 版本不可见，必须配套迁移（升级前 flush 旧键，等价于丢弃存量任务）。该
+// 变更登记在后续 breaking 窗口实施，不在本次修复中静默切换——避免一个
+// 补丁升级把运维的存量任务整体变成孤儿键。
+//
 // # 消费语义
 //
 // 支持两种投递模式（timertask.WithDeliveryMode / timertask.WithAtLeastOnce）：

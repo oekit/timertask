@@ -51,8 +51,14 @@ type Plan struct {
 //
 // planID 为计划 ID；trigger 为触发点标识（RFC3339，秒精度）——幂等键/
 // 互斥键/台账键三同源（execLockKey/RunRecord 同值），业务可直接拿去做
-// 幂等去重。返回错误只记台账与日志（local.Scheduler「任务失败不重试」
-// 同口径——需要重试语义请在任务内部实现）。
+// 幂等去重。返回错误触发 RetryBudget 的重试（#292）：每次尝试受
+// budget.Timeout 约束（ctx 带 deadline），尝试之间按 budget.Backoff 退避，
+// 总尝试次数 budget.Attempts；全部尝试失败才记台账失败并返回最后一次错误。
+//
+// 此前本注释写「任务失败不重试」（local.Scheduler 口径），而 RetryBudget
+// 的 Attempts/Backoff 只参与 LockTTL 公式、执行侧完全未生效——预算语义与
+// 行为分叉（#292）。现在两者同源：执行总时长上界 = LockTTL 公式的
+// Attempts*Timeout + 退避，租约不会先于执行过期。
 type Executor func(ctx context.Context, planID string, trigger string) error
 
 // StaleSweepFunc 是启动清扫钩子（对齐 zeus/task 的 FailStaleRunning 形态）：
@@ -88,6 +94,10 @@ func WithMutex(m Mutex) CronOption { return func(o *cronOptions) { o.mutex = m }
 
 // WithLedger 注入外置运行台账（DB 落库/审计流等），与内置 MemLedger 并联
 // 记录；nil = 只用内置（显式回退默认值，不算非法）。
+//
+// 多实例部署建议实现 LedgerQuery（#292）：接管重试在本实例无记录时必须
+// 核验「该触发点是否已由他实例执行」；只写不查的台账无法核验，接管重试
+// 会保守放弃（宁可不接管，不可双跑）。
 func WithLedger(l Ledger) CronOption { return func(o *cronOptions) { o.ledger = l } }
 
 // WithInstance 设置实例标识（台账归因/排障），缺省取主机名。
@@ -102,8 +112,9 @@ func WithClock(clock local.Clock) CronOption { return func(o *cronOptions) { o.c
 // local.Scheduler 同口径）。
 func WithLogger(l *slog.Logger) CronOption { return func(o *cronOptions) { o.logger = l } }
 
-// WithRetryBudget 设置执行重试预算（互斥锁 TTL 预算公式的唯一出处，
-// 见 RetryBudget）。
+// WithRetryBudget 设置执行重试预算（**执行重试与互斥锁 TTL 公式的唯一
+// 出处**：Attempts/Timeout/Backoff 驱动 fireAttempt 的执行与重试，四项
+// 共同决定 LockTTL，见 RetryBudget）。
 func WithRetryBudget(b RetryBudget) CronOption { return func(o *cronOptions) { o.budget = b } }
 
 // WithStaleSweep 设置启动清扫钩子（见 StaleSweepFunc）。
@@ -525,11 +536,59 @@ func (s *Scheduler) fireAttempt(ctx context.Context, planID string, at time.Time
 		Instance:  s.cfg.instance,
 		StartedAt: s.cfg.clock.Now(),
 	}
-	err = s.execSafe(ctx, planID, trigger)
+	// #292：执行走 RetryBudget——每次尝试 WithTimeout(budget.Timeout)，
+	// Attempts/Backoff 驱动重试；预算公式（LockTTL）从此与执行侧同源。
+	err = s.execWithBudget(ctx, planID, trigger)
 	rec.EndedAt = s.cfg.clock.Now()
 	rec.Err = err
 	s.record(ctx, rec)
 	return err
+}
+
+// execWithBudget 按 RetryBudget 驱动执行（#292）：总尝试 Attempts 次，每次
+// 套 context.WithTimeout(ctx, Timeout)（执行方必须尊重 ctx 取消——这是
+// Executor 的契约），两次尝试之间按 Backoff 退避（走注入时钟，FakeClock
+// 测试可确定性驱动）。
+//
+// 全部尝试失败返回最后一次错误；ctx 先被取消（引擎停机）时提前收尾，不再
+// 排下一次尝试。LockTTL = Attempts*Timeout + (Attempts-1)*Backoff + Slack
+// 覆盖最坏执行时长，租约不会先于执行过期（#244 公式的语义兑现）。
+func (s *Scheduler) execWithBudget(ctx context.Context, planID, trigger string) error {
+	budget := s.cfg.budget.Normalized()
+	var lastErr error
+	for attempt := 0; attempt < budget.Attempts; attempt++ {
+		if attempt > 0 {
+			if !s.waitBackoff(ctx, budget.Backoff) {
+				return lastErr
+			}
+		}
+		attemptCtx, cancel := context.WithTimeout(ctx, budget.Timeout)
+		lastErr = s.execSafe(attemptCtx, planID, trigger)
+		cancel()
+		if lastErr == nil {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return lastErr
+		}
+	}
+	return lastErr
+}
+
+// waitBackoff 等待一次重试退避；返回 false 表示等待被 ctx 取消打断。
+// 走注入时钟（#174/#259 同口径），FakeClock 下不需要真实 sleep。
+func (s *Scheduler) waitBackoff(ctx context.Context, d time.Duration) bool {
+	if d <= 0 {
+		return true
+	}
+	timer := s.cfg.clock.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C():
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 // execSafe 调用执行函数并把 panic 收编为错误（panic 不得打死触发引擎，
@@ -551,8 +610,13 @@ const takeoverRetryGuard = 2 * time.Second
 // scheduleTakeoverRetry 排一次 TTL 后的接管重试（#239，一次性，不递归）。
 // 重试前查运行台账：本触发点已有非 skip 记录（原持有者正常完成）⇒ 不重跑
 // ——租约「保留到 TTL 到期」的防重设计对崩溃与正常完成一视同仁，盲重试
-// 会把已完成的触发双跑。无法核验（外部台账只写不查）⇒ 保守放弃接管
+// 会把已完成的触发双跑。无法核验（外置台账只写不查）⇒ 保守放弃接管
 // （宁可不接管，不可双跑）。
+//
+// #292：核验面从前只查本进程 MemLedger，而接管场景的常态恰恰是「执行发生
+// 在持有锁的另一个实例上」⇒ 本实例无记录被无条件当作「未执行」，TTL 后
+// 重试必然重跑原持有者已完成的触发点（双跑击穿恰好一次）。现在外置 Ledger
+// 若实现 LedgerQuery（Ran）则据此核验；未实现/查询失败按无法核验保守放弃。
 //
 // 等待走注入时钟（clock.NewTimer 可停 timer，#174 同款，#259）——旧实现裸
 // time.NewTimer 绕过时钟注入，FakeClock 测试下接管重试走真实时间硬等
@@ -566,22 +630,44 @@ func (s *Scheduler) scheduleTakeoverRetry(ctx context.Context, planID string, at
 		case <-ctx.Done():
 			return
 		}
-		if s.triggerAlreadyRan(planID, at.UTC().Format(time.RFC3339)) {
+		trigger := at.UTC().Format(time.RFC3339)
+		if s.triggerAlreadyRan(ctx, planID, trigger) {
+			s.log.Debug("takeover retry abandoned: trigger already ran or unverifiable",
+				"plan", planID, "trigger", trigger)
 			return
 		}
 		_ = s.fireAttempt(ctx, planID, at, 1)
 	})
 }
 
-// triggerAlreadyRan 查内置 MemLedger 是否已有本触发点的**执行**记录
-// （非 skip）。外部 Ledger 只写不查 ⇒ 无法核验时保守返回 true（不重跑）。
-func (s *Scheduler) triggerAlreadyRan(planID, trigger string) bool {
+// triggerAlreadyRan 报告本触发点是否已有**执行**记录（非 skip），用于接管
+// 重试的防双跑闸（#239/#292）。
+//
+// 判定序：
+//  1. 本进程 MemLedger 有非 skip 记录 ⇒ 已执行（true）；
+//  2. 外置 Ledger 实现 LedgerQuery ⇒ 以 Ran 的结果为准；查询失败返回 true
+//     （无法核验，保守放弃接管）；
+//  3. 外置 Ledger 只写不查（或未注入）⇒ 无法核验，保守返回 true。
+//
+// 第 2/3 步是 #292 的语义修正：此前第 1 步 miss 即无条件返回 false，跨实例
+// 场景下「本实例无记录」是常态，会把原持有者已完成的触发点在 TTL 后重跑。
+func (s *Scheduler) triggerAlreadyRan(ctx context.Context, planID, trigger string) bool {
 	for _, rec := range s.mem.RecentFor(planID) {
 		if rec.Trigger == trigger && !rec.Skipped {
 			return true
 		}
 	}
-	return false
+	q, ok := s.cfg.ledger.(LedgerQuery)
+	if !ok {
+		return true
+	}
+	ran, err := q.Ran(ctx, planID, trigger)
+	if err != nil {
+		s.log.Error("run ledger query failed, takeover abandoned",
+			"plan", planID, "trigger", trigger, timertask.ErrKey, err)
+		return true
+	}
+	return ran
 }
 
 // recordSkip 记一条「未执行」台账（让位/故障 fail-closed，见 RunRecord）。

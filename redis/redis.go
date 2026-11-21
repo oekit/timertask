@@ -18,6 +18,15 @@ import (
 )
 
 const (
+	// ⚠️ 键空间（#292）：所有键共用同一个 hash tag `{timertask.<buzType>}`，
+	// WithBuckets 只是**单 slot 内的逻辑分片**（锁/扫描/本地队列粒度），
+	// 不提供 Redis Cluster 跨节点扩展——同 buzType 的 shard ZSet、processing
+	// 租约、retry_count hash、dead 死信、heartbeat 全落同一 slot。
+	//
+	// 把 hash tag 下沉到分片粒度 `{timertask.<buzType>.shard.N}` 需要
+	// processing/retry_count/dead 一并按分片拆分（Lua 原子脚本要求同 slot），
+	// 是键空间 breaking 变更：旧键对新版本不可见，升级前必须 flush 旧键。
+	// 该变更登记在后续 breaking 窗口，本版本不做静默切换（见包文档）。
 	taskKeyPattern = "{timertask.%s}.shard.%d"
 	heartbeatKey   = "{timertask.%s}.heartbeat"
 	deadLetterKey  = "{timertask.%s}.dead"
@@ -106,6 +115,13 @@ type RedisBackend struct {
 	stopChan   chan struct{}
 	stopOnce   sync.Once
 	workerWG   sync.WaitGroup // in-flight worker 排空等待(#242)
+	// consumeWG 等 consumeRemoteLoop 退出（#292）：停机序必须是
+	// close(stopChan) → join 消费者 → 排水 worker → 回灌 localQueue。
+	// 此前 Start 只等 workerWG，消费者可能在本轮 claim 已从 ZSet 原子删除后
+	// 才走到入队 select（localQueue 与已关闭 stopChan 同时就绪时 Go select
+	// 随机选）——回灌排水结束后迟到入队的 claim 留在 localQueue 里无人消费，
+	// at-most-once 永久丢任务、at-least-once 白等一个 visibilityTimeout。
+	consumeWG sync.WaitGroup
 	// st 是 Start 的状态机（#124），语义与 LocalBackend 一致，检查面单源
 	// timertask.StartState（#262），由 mu 保护：stopChan 关闭后不重建，不做
 	// 状态机的话二次 Start 会拉起一组立刻哑火的消费者（本实例消费吞吐静默
@@ -277,7 +293,11 @@ func (b *RedisBackend) Start(ctx context.Context) error {
 	async.GoSafe(func() { b.shardManager.StartAssign(ctx) })
 
 	// 启动远程队列消费
-	async.GoSafe(func() { b.consumeRemoteLoop(ctx) })
+	b.consumeWG.Add(1)
+	async.GoSafe(func() {
+		defer b.consumeWG.Done()
+		b.consumeRemoteLoop(ctx)
+	})
 
 	// at-least-once：启动租约回扫——崩溃实例未 Ack 的租约到期后由本循环捡回重投
 	if b.delivery == timertask.DeliveryAtLeastOnce {
@@ -300,6 +320,21 @@ func (b *RedisBackend) Start(ctx context.Context) error {
 	// 失败、重试全败，从未真正处理的任务被写进死信 ZSet（假死信）。
 	// stopOnce 防二次 Start 重复 close panic（与 LocalBackend 对称）。
 	b.stopOnce.Do(func() { close(b.stopChan) })
+	// #292：先 join 消费循环再排水/回灌。consumeRemoteOnce 可能在 claim
+	// （deleteScript 已原子删除分片 / claimLeaseScript 已移入租约集）之后才
+	// 走到入队 select——localQueue 有空间时它与已关闭的 stopChan 同时就绪，
+	// Go select 随机选 localQueue ⇒ 迟到入队。旧序（只等 workerWG 就
+	// 回灌）下这份 claim 会落在「回灌已排水完」的 localQueue 里无人再处理：
+	// at-most-once 永久丢失、at-least-once 白等一个 visibilityTimeout。
+	// join 保证所有入队/回灌动作都发生在排水之前。
+	//
+	// join 有界（与 worker 排水共用 DefaultShutdownDrainGrace）：Redis 黑洞
+	// （网络分区而非拒连）下消费者可能卡在客户端 ReadTimeout，无界 join 会
+	// 把 Start 退出路径挂死；超窗记警告并按原 at-most-once 语义收尾。
+	if !timertask.DrainWorkers(&b.consumeWG, timertask.DefaultShutdownDrainGrace) {
+		log.Warn("consumer join grace exceeded on shutdown, late claims may be dropped (at-most-once)",
+			"grace", timertask.DefaultShutdownDrainGrace)
+	}
 	// #242：等 in-flight worker 到达任务边界（有界宽限）——此前直接回灌，
 	// 正在执行的任务的租约同时被回灌面处理，执行与回灌赛跑：完成前回灌
 	// ⇒ 重启后双跑；完成后的 ack 与回灌竞态。宽限期内 worker 在任务边界

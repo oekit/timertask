@@ -24,8 +24,9 @@ const DefaultShutdownDrainGrace = 10 * time.Second
 // 临界段——LocalBackend.Send 的 stopped 检查与查重入堆同段、RedisBackend
 // 的检查与停机登记同锁——方法名以 Locked 结尾的约定调用方已持有后端锁。
 type StartState struct {
-	started bool
-	stopped bool
+	started  bool
+	stopping bool
+	stopped  bool
 }
 
 // BeginStartLocked 是 Start 入口的三态检查（#124，调用方须持有后端锁）：
@@ -44,10 +45,26 @@ func (st *StartState) BeginStartLocked() error {
 	return nil
 }
 
-// StoppedLocked 报告后端是否已停机（调用方须持有后端锁）。Send 等「停机后
-// 拒绝新任务」（#124）的入口与 Start 的停机登记共用本判定。
+// StoppedLocked 报告后端是否已不再接受新任务（调用方须持有后端锁）。
+// 两个阶段都返回 true（#292）：
+//
+//   - stopping：Start 已收到停机信号并在同一临界段关闭 stopChan——消费
+//     goroutine（scanLoop/consumeRemoteLoop）已经或即将退出，此后入队的任务
+//     不会再被消费。停机排水/回灌可能还要跑一段时间（in-flight worker 宽限、
+//     回灌窗口），窗口内 Send 必须立即拒绝，否则调用方拿到「提交成功」、
+//     任务只留在内存堆里，停机路径不处理堆内任务 ⇒ 永久丢失；
+//   - stopped：Start 已返回，实例进入终态。
+//
+// Send 等「停机后拒绝新任务」（#124）的入口与 Start 的停机登记共用本判定。
 func (st *StartState) StoppedLocked() bool {
-	return st.stopped
+	return st.stopping || st.stopped
+}
+
+// MarkStoppingLocked 登记「停机进行中」（调用方须持有后端锁）：Start 收到
+// 停机信号后、关闭 stopChan 的同一临界段调用（#292）。此后的 Send 立即返回
+// ErrBackendStopped，不再把任务压入无人消费的内存堆。
+func (st *StartState) MarkStoppingLocked() {
+	st.stopping = true
 }
 
 // MarkStoppedLocked 登记停机终态（调用方须持有后端锁）：Start 的停机收尾

@@ -28,6 +28,11 @@ const (
 // 此前该预算散在下游各自手算，口径漂移的后果是互斥提前过期——同 slot 被
 // 他实例接管、双跑破坏「触发点恰好一次」。公式必须单点：改预算只改这里。
 //
+// 公式的两侧同源（#292）：fireAttempt 的执行路径也按本预算走——每次尝试
+// 受 Timeout 约束（context.WithTimeout）、一共 Attempts 次、尝试之间按
+// Backoff 退避。四项都不是「只给 LockTTL 看的文档字段」：调大 Timeout 会
+// 真的放宽单次执行时限，也会同步抬 LockTTL，租约与执行不会分叉。
+//
 // 零值可用（Normalized 归一：Attempts < 1 取 1、Timeout <= 0 取
 // DefaultBudgetTimeout、Backoff 负值归 0、Slack <= 0 取 DefaultBudgetSlack
 // ——零值透传的才是缺省，不是「不要」；确需零余量显式给 1ns 这类正值）。

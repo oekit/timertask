@@ -212,6 +212,11 @@ func WithRetry(count int, delay time.Duration) TimerTaskOption {
 }
 
 // WithBuckets 设置任务桶数量（仅 Redis 后端 github.com/oekit/timertask/redis 有效），默认 128。
+//
+// 分片是**单 slot 内的逻辑分片**（#292）：同一 buzType 的所有键共用 hash tag
+// `{timertask.<buzType>}`，Redis Cluster 下仍落同一个 slot——WithBuckets 提供
+// 扫描/锁/本地队列的并行粒度，不提供跨节点吞吐或故障域扩展。跨节点扩展需
+// 键空间 breaking 变更（hash tag 下沉到分片粒度），见 redis 包文档。
 func WithBuckets(n int) TimerTaskOption {
 	return func(c *config) {
 		if n < 2 {
