@@ -10,7 +10,7 @@
 - fix: redis 后端 Start 停机序改「close→join 消费协程→drain worker→回灌」——claim 已删后的迟到入队丢任务窗口封死（#292）
 - fix: cron 接管重试新增 LedgerQuery 可查询核验——本实例无记录时查外置台账，查不到保守放弃接管（双跑修复）（#292）
 - fix: cron RetryBudget 真正作用于执行（WithTimeout/Attempts/Backoff）——执行超 LockTTL 不再被接管（#292）
-- docs: redis 键布局明写「单 slot 仅逻辑分片」（分片级 hash tag 属键空间 breaking，登记后续窗口）（#292）
+- docs: redis 键布局明写「单 slot 仅逻辑分片」（分片级 hash tag 会改变键空间划分，登记后续窗口）（#292）
 
 关联问题单：timertask#292。
 
