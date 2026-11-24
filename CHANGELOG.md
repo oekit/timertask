@@ -1,3 +1,60 @@
+## [v0.5.13] — 2026-11-23
+
+- build: 依赖地板对齐（矩阵地板波次）——新地板：github.com/oekit/pkg v0.60.0 。零行为变化；已发布产物的 go.mod 地板此前滞后于矩阵登记版本，本版把新地板焊进已发布产物。
+
+## [v0.5.12] — 2026-11-21
+
+- 第三轮设计/缺陷审计（2026-11-21）timertask 修复：
+
+- fix: local 后端停机窗口（close stopChan 同临界段）Send 立即 ErrBackendStopped——不再假成功丢任务（#292）
+- fix: redis 后端 Start 停机序改「close→join 消费协程→drain worker→回灌」——claim 已删后的迟到入队丢任务窗口封死（#292）
+- fix: cron 接管重试新增 LedgerQuery 可查询核验——本实例无记录时查外置台账，查不到保守放弃接管（双跑修复）（#292）
+- fix: cron RetryBudget 真正作用于执行（WithTimeout/Attempts/Backoff）——执行超 LockTTL 不再被接管（#292）
+- docs: redis 键布局明写「单 slot 仅逻辑分片」（分片级 hash tag 属键空间 breaking，登记后续窗口）（#292）
+
+关联问题单：timertask#292。
+
+## [v0.5.11] — 2026-11-20
+
+- fix(cron): budget 乘法补饱和上界钳（mulSaturate/addSaturate，对齐 retry #283 饱和哲学）——超大 Attempts 配置不再理论溢出；负租约防误报「公式破坏」的护栏触发面收窄（#285）
+docs(redis): 放置面 crc32 与分配面 fnv1a 双哈希交叉互注——刻意不同函数、用途不同，改动任一前先读另一处（#285）
+
+## [v0.5.10] — 2026-11-19
+
+- - fix: requeueClaim 停机回投改走 canonicalMember——第三条 member 写入面此前用裸 json.Marshal(task)，中断路径改写的 RetryCount 会让回投 member 与 canonical 字节分叉：at-most-once 下 ZAdd 变新增条目，业务同拍幂等重发即双 member 双跑（#76/#188 钉死的「同拍重发=同 member」不变量修复）；附 member 字节稳定性回归测试（#279）
+
+关联问题单：timertask#279。
+
+## [v0.5.9] — 2026-11-18
+
+- docs: cron LocalMutex 注明同族骨架 concurrency keyedTTLRegistry(#363) 跨 module 联动边界;地板对齐 concurrency v0.39.1
+
+## [redis/v0.2.22] — 2026-11-18
+
+- redis ShardManager 心跳/过期清理走注入时钟 WithShardClock,#152 时间单源覆盖分片面,假时钟可确定性测试(#260);指纹 diff 下沉 local.Scheduler(Entry.Fingerprint+InstallFor/InstalledKeys),cron 双层登记簿与 forced hack 移除,对账校验单源 internal/reconcile.ValidateDesiredSet(#261);根包导出 StartState/DrainWorkers/DefaultShutdownDrainGrace,Local/Redis 后端生命周期骨架与 10s 常量单源(#262)
+
+关联问题单：timertask#260、timertask#261、timertask#262。
+
+## [v0.5.8] — 2026-11-18
+
+- redis ShardManager 心跳/过期清理走注入时钟 WithShardClock,#152 时间单源覆盖分片面,假时钟可确定性测试(#260);指纹 diff 下沉 local.Scheduler(Entry.Fingerprint+InstallFor/InstalledKeys),cron 双层登记簿与 forced hack 移除,对账校验单源 internal/reconcile.ValidateDesiredSet(#261);根包导出 StartState/DrainWorkers/DefaultShutdownDrainGrace,Local/Redis 后端生命周期骨架与 10s 常量单源(#262)
+
+关联问题单：timertask#260、timertask#261、timertask#262。
+
+## [v0.5.7] — 2026-11-18
+
+- cron scheduleTakeoverRetry 等待走注入时钟 clock.NewTimer,#239 接管重试 FakeClock 下可确定性驱动(#259);nil-ctx 兜底收敛 contextx.OrBackground
+
+关联问题单：timertask#259。
+
+## [v0.5.6] — 2026-11-16
+
+- refactor: fmt.Errorf → oekit/pkg/errors 三形态对位替换（#520 替换波）+ 依赖地板抬至各依赖最新已发布版本（pkg v0.52.0）
+
+## [v0.5.5] — 2026-11-14
+
+- fix: 审计批报 5 单——clientID 时间戳⊕math/rand 混合(#237)/心跳失败尽力摘除注册条目(#238)/跨实例租约一次性接管重试带台账防双跑(#239)/LocalMutex ttl<=0 fail-fast(#240)/两后端停机 in-flight 有界排空(#242)(#241 已修已发/#243 契约冲突关单)
+
 ## [v0.5.4] — 2026-11-13
 
 - 租约/死信原子面：回投 member 字节稳定 + retry_count 迁 hash（#188）、RunWithRetry 基线取入参 RetryCount（#189）、日志 err 键根模块单源常量（#193）、死信写入与租约 Ack 原子化防毒丸无痕丢失（#197）、回归假绿修复 + RetryExhausted at-most-once 分支（#214）
@@ -11,6 +68,8 @@
 关联问题单：timertask#197。
 
 ## [v0.5.3] — 2026-11-13
+
+> ⚠️ **勘误（#217）**：本节声称的 #197 修复**实际首发于 v0.5.4**——本 tag 落点（04:56 UTC）早于修复 PR #209 合入 main（05:12 UTC），prewrite CHANGELOG → tag 的顺序把「版本节声称」与「tag 实际内容」劈开。消费者按本节定位 #197 会落空，请以 **v0.5.4** 节为准（同源劈叉见嵌套 redis/v0.2.21 节）。
 
 - fix(redis): 死信+摘租约 Lua 原子面——四路径半失败不再丢任务（#197）。新增 deadLetterAckScript：写失败即中止（租约保留下轮重试），成功后裁剪+摘租约；死信 member=marshal(task) 真实计数（#189）、摘租约 member=原始字节（#188）两参数分离。RetryExhausted 失败不置 terminal、onFailure 移到确认进死信后。
 

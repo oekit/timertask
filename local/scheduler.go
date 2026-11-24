@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/oekit/pkg/contextx"
 	pkgerrors "github.com/oekit/pkg/errors"
 	"github.com/oekit/pkg/timex/cron"
 
@@ -145,7 +146,7 @@ func New(cfg Config) (*Scheduler, error) {
 	switch cfg.CatchUp {
 	case CatchUpSkip, CatchUpAll:
 	default:
-		return nil, fmt.Errorf("local: invalid catch-up policy %d", int(cfg.CatchUp))
+		return nil, pkgerrors.Newf("local: invalid catch-up policy %d", int(cfg.CatchUp))
 	}
 	if cfg.Concurrency <= 0 {
 		cfg.Concurrency = defaultConcurrency
@@ -190,7 +191,7 @@ func (s *Scheduler) Schedule(spec string, fn Task) error {
 	}
 	sched, err := s.parseSpec(spec)
 	if err != nil {
-		return fmt.Errorf("local: parse cron %q: %w", spec, err)
+		return pkgerrors.Wrapf(err, "local: parse cron %q", spec)
 	}
 	// #123：可满足性校验。SpecSchedule.Next 对不可满足表达式静默返回零值，
 	// 调度器消费前必须兜住（见 ErrUnsatisfiableSpec）。
@@ -431,9 +432,8 @@ func (s *Scheduler) execute(e *entry, at time.Time) {
 	s.mu.Lock()
 	ctx := s.taskCtx
 	s.mu.Unlock()
-	if ctx == nil {
-		ctx = context.Background()
-	}
+	// 口径单源：pkg/contextx.OrBackground。
+	ctx = contextx.OrBackground(ctx)
 
 	// sem 阻塞可被 stopCh 唤醒（#79）：此前 execute 只监听 sem 与 Start 传入的
 	// ctx——Start 用不可取消 ctx（生产常态）时，配额占满后到达的任务阻塞在
@@ -490,7 +490,7 @@ func (s *Scheduler) checkSatisfiable(sched cron.Schedule) error {
 func (s *Scheduler) invoke(ctx context.Context, e *entry, at time.Time) (err error) {
 	defer func() {
 		if perr := pkgerrors.Recovered(recover()); perr != nil {
-			err = fmt.Errorf("task panic: %w", perr)
+			err = pkgerrors.Wrapf(perr, "task panic")
 		}
 	}()
 	return e.task(ctx, at)
@@ -552,6 +552,10 @@ type entry struct {
 	task     Task
 	// key 是业务键形态（#129）的注册键；spec 键形态为空串。
 	key string
+	// fingerprint 是业务键形态的 diff 指纹（#261）：派生规则 = 调用方指纹
+	// 留空取 spec（见 Entry.Fingerprint / InstallFor）。spec 键形态不参与
+	// keyed diff（ErrDuplicateSpec 防呆），恒为零值。
+	fingerprint string
 
 	mu       sync.Mutex
 	cond     *sync.Cond

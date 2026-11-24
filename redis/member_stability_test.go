@@ -177,3 +177,83 @@ func TestLeaseRequeue_RetryCountHashLifecycle(t *testing.T) {
 		t.Fatalf("终态后 processing = %d err=%v, want 0", proc, err)
 	}
 }
+
+// TestRequeueClaim_MemberStableWithRewrittenTask #279 回归测试：停机回投
+// （requeueClaim）产出的 member 必须与 Send 产出**同一字节串**——即使 claim
+// 携带的 task 指针已被中断路径改写 RetryCount。
+//
+// 缺陷成因：requeueClaim 用裸 json.Marshal(task)，而该 task 指针在
+// processTask 里被改写（retry-count hash 基线回写、RunWithRetry 重试推进，
+// redis.go:642-644 / retry.go:99），停机中断 → requeueClaim 时 marshal 出的
+// member 携带非零 retry_count，与 Send 的 canonical member 字节分叉 ⇒
+// at-most-once 下 ZAdd 变新增条目而非 score 更新，业务同拍幂等重发（Send）
+// 即两条 member 双跑——#76/#188 钉死的「同拍重发 = 同 member」不变量在第三
+// 写入面失效。
+//
+// 修复口径：requeueClaim 的两处 member 序列化（at-most-once 的 ZAdd member
+// 与 at-least-once 脚本 ARGV[2]）统一走 canonicalMember（#188 单源收编第三
+// 写入面）；canonicalMember 对已 canonical 的 task 幂等。
+func TestRequeueClaim_MemberStableWithRewrittenTask(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		atLeast bool
+	}{
+		{"at-most-once", false},
+		{"at-least-once", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b, _ := newTestRedisBackend(t)
+			if tc.atLeast {
+				b.delivery = timertask.DeliveryAtLeastOnce
+			}
+			ctx := context.Background()
+			task := &timertask.Task{
+				ID:       "rq-1",
+				EndTime:  time.Now().Unix() - 10,
+				Action:   "act",
+				Param:    `{"x":1}`,
+				MaxRetry: 3,
+			}
+			if err := b.Send(ctx, task); err != nil {
+				t.Fatal(err)
+			}
+			key := b.taskKey(task.ID)
+			members, err := b.client.ZRange(ctx, key, 0, -1).Result()
+			if err != nil || len(members) != 1 {
+				t.Fatalf("Send 后分片条目数 = %d err=%v, want 1", len(members), err)
+			}
+			sendMember := members[0]
+
+			// 模拟中断路径的改写：processTask 把 retry-count hash 基线 /
+			// RunWithRetry 的推进写回 task 指针后停机中断，回灌的就是这份
+			// 已被改写的 task（RetryCount ≠ 0）。
+			rewritten := *task
+			rewritten.RetryCount = 2
+			if !b.requeueClaim(ctx, &claim{task: &rewritten, member: sendMember}) {
+				t.Fatal("requeueClaim 失败")
+			}
+
+			// 回投后分片必须仍只有 1 条且字节 == Send member：修复前裸
+			// marshal 产出携带 retry_count=2 的分叉字节串，ZAdd 新增条目
+			// （at-most-once）或脚本回投分叉 member（at-least-once）。
+			after, err := b.client.ZRange(ctx, key, 0, -1).Result()
+			if err != nil || len(after) != 1 {
+				t.Fatalf("回投后分片条目数 = %d err=%v, want 1（双 member 即双跑）", len(after), err)
+			}
+			if after[0] != sendMember {
+				t.Fatalf("回投 member != Send member（#279 不变量被打破）:\n  send    = %s\n  requeue = %s",
+					sendMember, after[0])
+			}
+			// 直接钉单源：requeueClaim 的 member 序列化必须与 canonicalMember
+			// 产出同一字节串。
+			canonical, err := b.canonicalMember(&rewritten)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if after[0] != canonical {
+				t.Fatalf("回投 member != canonicalMember 产出:\n  canonical = %s\n  requeue   = %s",
+					canonical, after[0])
+			}
+		})
+	}
+}

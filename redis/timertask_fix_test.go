@@ -2,7 +2,6 @@ package redis
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"testing"
 	"time"
@@ -108,13 +107,15 @@ func TestRedisBackend_RequeueOnShutdown(t *testing.T) {
 		t.Fatalf("expected local queue drained, got %d", b.LocalPendingCount())
 	}
 
-	// 任务必须回到原分片 ZSet（EndTime 保留）
+	// 任务必须回到原分片 ZSet（EndTime 保留）。member 走 canonicalMember
+	// 口径（#279：回投与 Send 同一字节串），裸 json.Marshal 与 canonical
+	// 字节分叉（CreateTime 钉 EndTime）会查不到条目。
 	key := b.taskKey("requeue-1")
-	data, err := json.Marshal(queued)
+	data, err := b.canonicalMember(queued)
 	if err != nil {
-		t.Fatalf("marshal: %v", err)
+		t.Fatalf("canonicalMember: %v", err)
 	}
-	score, err := b.client.ZScore(context.Background(), key, string(data)).Result()
+	score, err := b.client.ZScore(context.Background(), key, data).Result()
 	if err != nil {
 		t.Fatalf("requeued task not found in %s: %v", key, err)
 	}

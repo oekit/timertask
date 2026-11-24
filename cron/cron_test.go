@@ -341,7 +341,10 @@ func TestFire_LedgerFanOut(t *testing.T) {
 func TestFire_ExecutorPanicRecorded(t *testing.T) {
 	probe := newExecProbe()
 	probe.panics = true
-	s, clock := newTestScheduler(t, probe.exec)
+	// #292：执行预算默认会重试（FakeClock 下退避 timer 需手动推进），本测试
+	// 只钉 panic 收编，Attempts=1 让失败立刻落台账。
+	s, clock := newTestScheduler(t, probe.exec,
+		WithRetryBudget(RetryBudget{Attempts: 1, Timeout: time.Second, Slack: time.Second}))
 	if err := s.Reconcile(context.Background(), []Plan{{ID: "t1", Spec: "@every 1m", Enabled: true}}); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
@@ -696,5 +699,69 @@ func TestUpsertAfterStopTerminal(t *testing.T) {
 	}
 	if err := s.StartReconcile(context.Background(), time.Minute, func() ([]Plan, error) { return nil, nil }); !errors.Is(err, ErrSchedulerStopped) {
 		t.Fatalf("停机后 StartReconcile 应报错, got %v", err)
+	}
+}
+
+// TestReconcile_SpecChangeWithStaleFingerprintReinstalls 钉住 #261 的正确性
+// 修复（forced hack 移除路径的回归）：spec 变而指纹未变（调用方忘了 bump
+// fingerprint）⇒ 仍收敛到期望 spec——登记簿单源 inner 后，diff 看
+// （Spec, Fingerprint）二元组，不再有 cron 镜像「指纹未变 ⇒ 幂等」挡住
+// spec 变更的漂移面（旧实现此处静默保留旧 spec，期望集失真）。
+func TestReconcile_SpecChangeWithStaleFingerprintReinstalls(t *testing.T) {
+	probe := newExecProbe()
+	s, clock := newTestScheduler(t, probe.exec)
+	if err := s.Reconcile(context.Background(), []Plan{
+		{ID: "t1", Spec: "@every 1m", Fingerprint: "fp1", Enabled: true},
+	}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	clock.Advance(time.Minute)
+	if got := waitCalls(t, probe.ch, 1)[0]; got != "t1@2026-11-11T00:01:00Z" {
+		t.Fatalf("首触发不符: %q", got)
+	}
+
+	// spec 变为 @every 2m、指纹未变：重装（基准 = T+1m ⇒ 首触发 T+3m）。
+	if err := s.Reconcile(context.Background(), []Plan{
+		{ID: "t1", Spec: "@every 2m", Fingerprint: "fp1", Enabled: true},
+	}); err != nil {
+		t.Fatalf("Reconcile(spec 变): %v", err)
+	}
+	clock.Advance(time.Minute) // T+2m：旧 spec 本会触发（幂等挡住时的漂移形态）
+	select {
+	case got := <-probe.ch:
+		t.Fatalf("spec 变更未生效（旧实现指纹未变幂等挡住）：%q", got)
+	case <-time.After(200 * time.Millisecond):
+	}
+	clock.Advance(time.Minute) // T+3m：新 spec 从新基准的首触发
+	if got := waitCalls(t, probe.ch, 1)[0]; got != "t1@2026-11-11T00:03:00Z" {
+		t.Fatalf("新 spec 未生效: %q", got)
+	}
+}
+
+// TestReconcile_BadSpecChangeKeepsOld 钉住装配失败的原子性（#261 forced hack
+// 移除后的正确性支柱）：指纹变化 + spec 变为不可满足 ⇒ 该条失败汇总报错，
+// 既有注册原样保留（旧 spec 照常触发）——local.InstallFor 校验先于任何变更，
+// 「先摘后装、摘了装不上」的中间态不复存在。
+func TestReconcile_BadSpecChangeKeepsOld(t *testing.T) {
+	probe := newExecProbe()
+	s, clock := newTestScheduler(t, probe.exec)
+	if err := s.Reconcile(context.Background(), []Plan{
+		{ID: "t1", Spec: "@every 1m", Fingerprint: "fp1", Enabled: true},
+	}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	clock.Advance(time.Minute)
+	waitCalls(t, probe.ch, 1)
+
+	err := s.Reconcile(context.Background(), []Plan{
+		{ID: "t1", Spec: "0 0 31 2 *", Fingerprint: "fp2", Enabled: true}, // 指纹变 + 不可满足
+	})
+	if err == nil || !strings.Contains(err.Error(), "t1") {
+		t.Fatalf("坏 spec 条目应失败并携带 ID, got %v", err)
+	}
+	// 既有注册不受影响：t1 仍按旧 spec 触发（T+2m）。
+	clock.Advance(time.Minute)
+	if got := waitCalls(t, probe.ch, 1)[0]; got != "t1@2026-11-11T00:02:00Z" {
+		t.Fatalf("失败装配动了既有注册：%q，期望 t1@00:02:00Z（旧 spec 保留）", got)
 	}
 }

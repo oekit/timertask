@@ -82,7 +82,7 @@ func TestLocalBackend_ConcurrentStart_Rejected(t *testing.T) {
 	deadline := time.Now().Add(2 * time.Second)
 	for {
 		b.mu.Lock()
-		started := b.started
+		started := b.st.started
 		b.mu.Unlock()
 		if started {
 			break

@@ -47,6 +47,22 @@ type Ledger interface {
 	Record(ctx context.Context, rec RunRecord)
 }
 
+// LedgerQuery 是运行台账的**可选核验面**（#292）：外置 Ledger 若支持按
+// (planID, trigger) 查询「是否已有非 skip 的执行记录」，实现本接口即可让
+// 接管重试（scheduleTakeoverRetry）在「本实例 MemLedger 无记录」时继续
+// 安全判定。
+//
+// 只实现 Ledger（只写不查）的台账视为无法核验：接管重试**保守放弃**
+// （宁可不接管，不可双跑）——跨实例场景下「本实例无记录」是常态（执行发生
+// 在持有锁的另一个实例上），把它当作「未执行」会让接管重试在租约 TTL 到期
+// 后重跑已完成的触发点，恰好击穿「触发点恰好一次」。
+//
+// Ran 返回 error 同样按无法核验处理（保守放弃）；实现方应只统计
+// Skipped=false 的记录（让位记录不代表执行）。
+type LedgerQuery interface {
+	Ran(ctx context.Context, planID, trigger string) (ran bool, err error)
+}
+
 // MemLedger 是内置有界运行台账（环形覆盖，New 缺省挂载）：RunHistory 的
 // 读取面，永不无界增长。
 type MemLedger struct {

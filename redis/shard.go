@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"hash/fnv"
+	mrand "math/rand"
 	"slices"
 	"strconv"
 	"sync"
@@ -14,8 +15,26 @@ import (
 	"time"
 
 	"github.com/oekit/logx"
+	"github.com/oekit/timertask"
 	goredis "github.com/redis/go-redis/v9"
 )
+
+// ShardOption 配置 ShardManager 的可选参数（函数选项模式，XxxOption 纪律）。
+type ShardOption func(*shardOptions)
+
+// shardOptions 是 ShardManager 的配置集合（New 时定版）。
+type shardOptions struct {
+	clock timertask.Clock
+}
+
+// WithShardClock 注入时钟（#260，#152 时间单源的补面）：心跳注册时间戳与
+// 过期清理阈值走注入时钟——分片面的时间判断与 RedisBackend 的任务时间判断
+// （#152 b.now()）同源，测试注入假时钟后心跳 TTL 判定/过期清理不必真睡即可
+// 断言。nil/缺省取真实时钟（与 b.now 的零值兜底同口径；nil 参数 = 显式回退
+// 默认值，不算非法）。
+func WithShardClock(clock timertask.Clock) ShardOption {
+	return func(o *shardOptions) { o.clock = clock }
+}
 
 // ShardManager 分片管理器。
 // 负责心跳注册、一致性哈希分配分片。
@@ -32,19 +51,30 @@ type ShardManager struct {
 	// 复活分片归属，恰好复现心跳失败清分片要防的双归属窗口。
 	heartbeatOK atomic.Bool
 
+	// clock 时钟抽象（#260）：心跳时间戳与过期清理阈值单源走 now()——
+	// 分片面的时间判断不再绕开 #152 的时钟注入。nil 取真实时钟。
+	// 心跳/分配的 ticker 节奏是循环调度约束（与 consumeRemoteLoop 的
+	// 500ms ticker 同口径），维持真实时钟。
+	clock timertask.Clock
+
 	// 心跳配置
 	heartbeatInterval time.Duration
 	heartbeatTimeout  time.Duration
 }
 
 // NewShardManager 创建分片管理器。
-func NewShardManager(buzType string, client goredis.UniversalClient, totalShards int) *ShardManager {
+func NewShardManager(buzType string, client goredis.UniversalClient, totalShards int, opts ...ShardOption) *ShardManager {
+	var o shardOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
 	clientID := generateClientID()
 	return &ShardManager{
 		clientID:          clientID,
 		buzType:           buzType,
 		client:            client,
 		totalShards:       totalShards,
+		clock:             o.clock,
 		heartbeatInterval: 300 * time.Millisecond,
 		heartbeatTimeout:  5 * time.Second,
 	}
@@ -57,7 +87,9 @@ func generateClientID() string {
 	b := make([]byte, 8)
 	if _, err := rand.Read(b); err != nil {
 		// 回退：crypto 不可用时用时间戳 + math/rand 保证唯一性，而非 panic
-		binary.BigEndian.PutUint64(b, uint64(time.Now().UnixNano()))
+		//（#237：注释声称两者混合，实现只有时间戳——同纳秒启动的两实例
+		// 会撞 ID。时间戳 ⊕ math/rand 混合。）
+		binary.BigEndian.PutUint64(b, uint64(time.Now().UnixNano())^mrand.Uint64())
 	}
 	return hex.EncodeToString(b)
 }
@@ -77,10 +109,20 @@ func (s *ShardManager) StartHeartbeat(ctx context.Context) {
 	}
 }
 
+// now 返回注入时钟的当前时间（#260）：分片面的时间判断（心跳时间戳、过期
+// 清理阈值）单源走这里，与 RedisBackend.now（#152）同一形态。
+// nil 取真实时钟（零值兜底，与同包口径一致）。
+func (s *ShardManager) now() time.Time {
+	if s.clock == nil {
+		return time.Now()
+	}
+	return s.clock.Now()
+}
+
 // heartbeat 注册心跳。
 func (s *ShardManager) heartbeat(ctx context.Context) {
 	key := s.heartbeatKey()
-	now := time.Now().UnixMilli()
+	now := s.now().UnixMilli() // #260：心跳时间戳与过期阈值走注入时钟
 
 	// 使用 ZADD 注册心跳（score 为时间戳）
 	_, err := s.client.ZAdd(ctx, key, goredis.Z{
@@ -94,6 +136,13 @@ func (s *ShardManager) heartbeat(ctx context.Context) {
 		s.mu.Lock()
 		s.myShards = nil
 		s.mu.Unlock()
+		// #238：尽力摘除自己的注册条目——否则条目要等 heartbeatTimeout(5s)
+		// 过期清理，期间其他实例的一致性哈希仍把分片路由给本实例（本实例
+		// 已停消费 ⇒ 分片最长 5s 无人消费）。ZRem 失败回落到超时清理
+		// （写路径故障下尽力而为）。
+		if _, zerr := s.client.ZRem(ctx, key, s.clientID).Result(); zerr != nil {
+			log.Warn("remove own heartbeat entry failed after heartbeat failure (fallback to TTL expiry)", logx.ErrKey, zerr)
+		}
 		return
 	}
 	s.heartbeatOK.Store(true)
@@ -197,6 +246,11 @@ func (s *ShardManager) heartbeatKey() string {
 }
 
 // simpleHash 使用 FNV-1a 计算哈希，分布更均匀。
+//
+// 这是客户端分配哈希：按「buzType-分片号」把分片派给在线实例（归属面分配）。
+// 与 redis/redis.go taskKey 的任务放置哈希（crc32 按任务 ID 路由分片键，
+// 数据面）**刻意不同函数**——用途不同、不要求同哈希；改动任一前先读另一处，
+// 勿使任务放置与实例分配视图漂移（#285）。
 func simpleHash(s string) uint32 {
 	h := fnv.New32a()
 	h.Write([]byte(s))

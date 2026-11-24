@@ -3,7 +3,6 @@ package cron
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log/slog"
 	"os"
 	"sync"
@@ -14,6 +13,7 @@ import (
 
 	"github.com/oekit/timertask"
 	"github.com/oekit/timertask/internal/gosafe"
+	"github.com/oekit/timertask/internal/reconcile"
 	"github.com/oekit/timertask/local"
 )
 
@@ -51,8 +51,14 @@ type Plan struct {
 //
 // planID 为计划 ID；trigger 为触发点标识（RFC3339，秒精度）——幂等键/
 // 互斥键/台账键三同源（execLockKey/RunRecord 同值），业务可直接拿去做
-// 幂等去重。返回错误只记台账与日志（local.Scheduler「任务失败不重试」
-// 同口径——需要重试语义请在任务内部实现）。
+// 幂等去重。返回错误触发 RetryBudget 的重试（#292）：每次尝试受
+// budget.Timeout 约束（ctx 带 deadline），尝试之间按 budget.Backoff 退避，
+// 总尝试次数 budget.Attempts；全部尝试失败才记台账失败并返回最后一次错误。
+//
+// 此前本注释写「任务失败不重试」（local.Scheduler 口径），而 RetryBudget
+// 的 Attempts/Backoff 只参与 LockTTL 公式、执行侧完全未生效——预算语义与
+// 行为分叉（#292）。现在两者同源：执行总时长上界 = LockTTL 公式的
+// Attempts*Timeout + 退避，租约不会先于执行过期。
 type Executor func(ctx context.Context, planID string, trigger string) error
 
 // StaleSweepFunc 是启动清扫钩子（对齐 zeus/task 的 FailStaleRunning 形态）：
@@ -88,6 +94,10 @@ func WithMutex(m Mutex) CronOption { return func(o *cronOptions) { o.mutex = m }
 
 // WithLedger 注入外置运行台账（DB 落库/审计流等），与内置 MemLedger 并联
 // 记录；nil = 只用内置（显式回退默认值，不算非法）。
+//
+// 多实例部署建议实现 LedgerQuery（#292）：接管重试在本实例无记录时必须
+// 核验「该触发点是否已由他实例执行」；只写不查的台账无法核验，接管重试
+// 会保守放弃（宁可不接管，不可双跑）。
 func WithLedger(l Ledger) CronOption { return func(o *cronOptions) { o.ledger = l } }
 
 // WithInstance 设置实例标识（台账归因/排障），缺省取主机名。
@@ -102,8 +112,9 @@ func WithClock(clock local.Clock) CronOption { return func(o *cronOptions) { o.c
 // local.Scheduler 同口径）。
 func WithLogger(l *slog.Logger) CronOption { return func(o *cronOptions) { o.logger = l } }
 
-// WithRetryBudget 设置执行重试预算（互斥锁 TTL 预算公式的唯一出处，
-// 见 RetryBudget）。
+// WithRetryBudget 设置执行重试预算（**执行重试与互斥锁 TTL 公式的唯一
+// 出处**：Attempts/Timeout/Backoff 驱动 fireAttempt 的执行与重试，四项
+// 共同决定 LockTTL，见 RetryBudget）。
 func WithRetryBudget(b RetryBudget) CronOption { return func(o *cronOptions) { o.budget = b } }
 
 // WithStaleSweep 设置启动清扫钩子（见 StaleSweepFunc）。
@@ -123,13 +134,9 @@ func WithCatchUp(p local.CatchUpPolicy) CronOption { return func(o *cronOptions)
 // time.Local）。
 func WithLocation(loc *time.Location) CronOption { return func(o *cronOptions) { o.location = loc } }
 
-// planState 是已装入触发引擎的计划状态（指纹 diff 的本地镜像）。
-type planState struct {
-	spec        string
-	fingerprint string // 归一后的指纹（Plan.Fingerprint 为空时派生 = Spec）
-}
-
 // planFingerprint 返回计划的 diff 指纹（留空派生 = Spec，见 Plan.Fingerprint）。
+// #261：指纹 diff 的登记与判定单源下沉 local.Scheduler.InstallFor——本函数
+// 只负责把 Plan 归一成 local 侧的指纹参数，调度器不再自持登记簿镜像。
 func planFingerprint(p Plan) string {
 	if p.Fingerprint != "" {
 		return p.Fingerprint
@@ -150,8 +157,12 @@ type Scheduler struct {
 	// 与新条目补跑可撞同一 slot，进程内先裁决，不劳分布式锁。
 	slotMu *LocalMutex
 
+	// stopped 是调度器自身的停机终态（#124 实例一次性，由 mu 保护）。
+	// 已装计划的登记簿单源在 inner（local.Scheduler 的 keyed 表，#261）：
+	// 指纹 diff、幂等判定与「已装清单」都从 inner 读——此前 cron 侧自持
+	// 一份 plans 镜像，与 inner 的幂等规则（按 spec）分叉，指纹变了装不上
+	// 只能「先摘后装」forced hack 且摘了装不上要手动回滚。
 	mu      sync.Mutex
-	plans   map[string]*planState
 	stopped bool
 
 	engineCtx       context.Context
@@ -175,6 +186,9 @@ func New(exec Executor, opts ...CronOption) *Scheduler {
 			Attempts: DefaultBudgetAttempts,
 			Timeout:  DefaultBudgetTimeout,
 			Backoff:  DefaultBudgetBackoff,
+			// timertask#244：显式自解释（Normalized 本会补缺省，但默认值
+			// 面上写全让读者一眼看到四项都参与 LockTTL 公式）。
+			Slack: DefaultBudgetSlack,
 		},
 	}
 	for _, opt := range opts {
@@ -212,7 +226,6 @@ func New(exec Executor, opts ...CronOption) *Scheduler {
 		inner:      inner,
 		mem:        NewMemLedger(cfg.runCapacity),
 		slotMu:     NewLocalMutex(cfg.clock),
-		plans:      make(map[string]*planState),
 		engineDone: make(chan struct{}),
 		stopCh:     make(chan struct{}),
 	}
@@ -251,22 +264,25 @@ func New(exec Executor, opts ...CronOption) *Scheduler {
 //   - 单条失败（坏 spec 等）**不阻断**其余条目收敛，失败逐条汇总进返回
 //     错误（errors.Join）；
 //   - 期望集内 ID 重复 / 空 ID ⇒ 「以哪条为准」存在歧义，fail-closed：
-//     本次调用不做任何变更并返回错误；
+//     本次调用不做任何变更并返回错误（校验块单源
+//     internal/reconcile.ValidateDesiredSet，#261——与 local.Reconcile
+//     同一块判定）；
 //   - 首次调用自动拉起触发引擎（StartReconcile 形态亦然）。
 //
 // errors 全部成功时返回 nil；调用方通常应串行化对账（单 goroutine 周期
 // 触发）——并发调用无数据竞争，但收敛次序不保证。停机后返回
 // ErrSchedulerStopped（实例一次性，#124）。
 func (s *Scheduler) Reconcile(ctx context.Context, plans []Plan) error {
-	seen := make(map[string]bool, len(plans))
+	ids := make([]string, len(plans))
 	for i := range plans {
-		if plans[i].ID == "" {
-			return errors.New("cron: reconcile: empty plan ID in desired set")
-		}
-		if seen[plans[i].ID] {
-			return fmt.Errorf("cron: reconcile: duplicate plan ID %q in desired set", plans[i].ID)
-		}
-		seen[plans[i].ID] = true
+		ids[i] = plans[i].ID
+	}
+	if err := reconcile.ValidateDesiredSet("cron", "plan ID", ids); err != nil {
+		return err
+	}
+	seen := make(map[string]bool, len(plans))
+	for _, id := range ids {
+		seen[id] = true
 	}
 
 	s.mu.Lock()
@@ -285,20 +301,15 @@ func (s *Scheduler) Reconcile(ctx context.Context, plans []Plan) error {
 			continue
 		}
 		if err := s.install(ctx, p); err != nil {
-			errs = append(errs, fmt.Errorf("cron: reconcile %q: %w", p.ID, err))
+			errs = append(errs, pkgerrors.Wrapf(err, "cron: reconcile %q", p.ID))
 		}
 	}
-	// 已装但不在期望集：注销（期望集是唯一事实源）。
-	s.mu.Lock()
-	vanished := make([]string, 0, len(s.plans))
-	for id := range s.plans {
+	// 已装但不在期望集：注销（期望集是唯一事实源）。已装清单读 inner 的
+	// 登记簿（local.InstalledKeys，#261 单源）——不再自持镜像。
+	for _, id := range s.inner.InstalledKeys() {
 		if !seen[id] {
-			vanished = append(vanished, id)
+			s.Remove(ctx, id)
 		}
-	}
-	s.mu.Unlock()
-	for _, id := range vanished {
-		s.Remove(ctx, id)
 	}
 	return errors.Join(errs...)
 }
@@ -327,11 +338,8 @@ func (s *Scheduler) Upsert(ctx context.Context, p Plan) error {
 
 // Remove 按计划 ID 注销（运行期删），返回是否确实移除了触发条目。正在
 // 执行的触发不打断（执行已进台账），未开始的触发丢弃（local.UnscheduleFor
-// 同语义）。
+// 同语义）。#261：登记簿单源 inner——直接按 ID 注销，无须先擦自身镜像。
 func (s *Scheduler) Remove(_ context.Context, id string) bool {
-	s.mu.Lock()
-	delete(s.plans, id)
-	s.mu.Unlock()
 	return s.inner.UnscheduleFor(id)
 }
 
@@ -418,40 +426,22 @@ func (s *Scheduler) RunHistory(planID string) []RunRecord {
 	return s.mem.RecentFor(planID)
 }
 
-// install 是单条计划的增量装配（Reconcile/Upsert 共用）：指纹 diff 判定 +
-// local.ScheduleFor 装配。指纹未变零调用（不重置触发基准）；指纹变化且
-// spec 未变时先摘后装强制重置（local.ScheduleFor 按 spec 判幂等会空操作）。
+// install 是单条计划的增量装配（Reconcile/Upsert 共用）：指纹 diff 判定与
+// 装配单源 local.InstallFor（#261）——指纹未变幂等空操作（不重置触发基准），
+// spec 或指纹任一变化摘旧装新。local 侧校验先于任何变更：坏 spec/不可满足
+// 等失败路径的既有注册原样保留，「摘了装不上」不再存在，forced hack（先
+// UnscheduleFor 再 ScheduleFor + 失败手动回滚镜像）随之移除。
 func (s *Scheduler) install(_ context.Context, p Plan) error {
-	fp := planFingerprint(p)
 	s.mu.Lock()
-	if s.stopped {
-		s.mu.Unlock()
+	stopped := s.stopped
+	s.mu.Unlock()
+	if stopped {
 		return ErrSchedulerStopped
 	}
-	cur := s.plans[p.ID]
-	if cur != nil && cur.fingerprint == fp {
-		s.mu.Unlock()
-		return nil // 指纹未变：幂等空操作（防 @every 被周期重装重置触发点）
-	}
-	forced := cur != nil && cur.spec == p.Spec
-	s.mu.Unlock()
-
 	fn := func(ctx context.Context, at time.Time) error { return s.fire(ctx, p.ID, at) }
-	if forced {
-		s.inner.UnscheduleFor(p.ID)
+	if err := s.inner.InstallFor(p.ID, p.Spec, planFingerprint(p), fn); err != nil {
+		return pkgerrors.Wrapf(err, "install %q", p.ID)
 	}
-	if err := s.inner.ScheduleFor(p.ID, p.Spec, fn); err != nil {
-		if forced {
-			// 摘了没装上：状态与实际一致（未装），下轮对账重试。
-			s.mu.Lock()
-			delete(s.plans, p.ID)
-			s.mu.Unlock()
-		}
-		return fmt.Errorf("install %q: %w", p.ID, err)
-	}
-	s.mu.Lock()
-	s.plans[p.ID] = &planState{spec: p.Spec, fingerprint: fp}
-	s.mu.Unlock()
 	return nil
 }
 
@@ -480,6 +470,12 @@ func (s *Scheduler) reconcileOnce(ctx context.Context, listFn func() ([]Plan, er
 // 互斥让位/互斥设施故障是**未执行**（不是任务失败），记台账 + 日志后返回
 // nil——让位是多实例常态（Debug），设施故障是告警面（Error）。
 func (s *Scheduler) fire(ctx context.Context, planID string, at time.Time) error {
+	return s.fireAttempt(ctx, planID, at, 0)
+}
+
+// fireAttempt 带 attempt 计数的触发执行面（#239 接管重试的防环闸）：
+// attempt==0 是正常调度路径；==1 是崩溃接管重试（只重试一次）。
+func (s *Scheduler) fireAttempt(ctx context.Context, planID string, at time.Time, attempt int) error {
 	trigger := at.UTC().Format(time.RFC3339)
 	key := execLockKey(planID, trigger)
 	ttl := s.cfg.budget.LockTTL() // 锁 TTL 预算公式单一出处（RetryBudget）
@@ -511,6 +507,14 @@ func (s *Scheduler) fire(ctx context.Context, planID string, at time.Time) error
 			// 一次的正常形态）。
 			s.recordSkip(ctx, planID, trigger, nil)
 			s.log.Debug("exec slot taken by other instance", "plan", planID, "trigger", trigger)
+			// #239：接管重试（一次性）——「TTL 到期自动可被他实例接管」的
+			// 接管者此前不存在：认领即消费，唯一一次 fire 落空后该触发点
+			// 永久丢失（持有者崩溃形态）。TTL 到期后重试一次；重试前查台账
+			// 防双跑（原持有者正常完成 ⇒ 让位；仍被持 ⇒ 持有者活着且执行
+			// 超预算，RetryBudget 边界 ⇒ 放弃）。
+			if attempt == 0 {
+				s.scheduleTakeoverRetry(ctx, planID, at, ttl)
+			}
 			return nil
 		case merr != nil:
 			// 互斥设施故障：fail-closed 跳过（宁可漏跑一轮可补发，不可双跑）。
@@ -532,11 +536,59 @@ func (s *Scheduler) fire(ctx context.Context, planID string, at time.Time) error
 		Instance:  s.cfg.instance,
 		StartedAt: s.cfg.clock.Now(),
 	}
-	err = s.execSafe(ctx, planID, trigger)
+	// #292：执行走 RetryBudget——每次尝试 WithTimeout(budget.Timeout)，
+	// Attempts/Backoff 驱动重试；预算公式（LockTTL）从此与执行侧同源。
+	err = s.execWithBudget(ctx, planID, trigger)
 	rec.EndedAt = s.cfg.clock.Now()
 	rec.Err = err
 	s.record(ctx, rec)
 	return err
+}
+
+// execWithBudget 按 RetryBudget 驱动执行（#292）：总尝试 Attempts 次，每次
+// 套 context.WithTimeout(ctx, Timeout)（执行方必须尊重 ctx 取消——这是
+// Executor 的契约），两次尝试之间按 Backoff 退避（走注入时钟，FakeClock
+// 测试可确定性驱动）。
+//
+// 全部尝试失败返回最后一次错误；ctx 先被取消（引擎停机）时提前收尾，不再
+// 排下一次尝试。LockTTL = Attempts*Timeout + (Attempts-1)*Backoff + Slack
+// 覆盖最坏执行时长，租约不会先于执行过期（#244 公式的语义兑现）。
+func (s *Scheduler) execWithBudget(ctx context.Context, planID, trigger string) error {
+	budget := s.cfg.budget.Normalized()
+	var lastErr error
+	for attempt := 0; attempt < budget.Attempts; attempt++ {
+		if attempt > 0 {
+			if !s.waitBackoff(ctx, budget.Backoff) {
+				return lastErr
+			}
+		}
+		attemptCtx, cancel := context.WithTimeout(ctx, budget.Timeout)
+		lastErr = s.execSafe(attemptCtx, planID, trigger)
+		cancel()
+		if lastErr == nil {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return lastErr
+		}
+	}
+	return lastErr
+}
+
+// waitBackoff 等待一次重试退避；返回 false 表示等待被 ctx 取消打断。
+// 走注入时钟（#174/#259 同口径），FakeClock 下不需要真实 sleep。
+func (s *Scheduler) waitBackoff(ctx context.Context, d time.Duration) bool {
+	if d <= 0 {
+		return true
+	}
+	timer := s.cfg.clock.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C():
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 // execSafe 调用执行函数并把 panic 收编为错误（panic 不得打死触发引擎，
@@ -545,10 +597,77 @@ func (s *Scheduler) fire(ctx context.Context, planID string, at time.Time) error
 func (s *Scheduler) execSafe(ctx context.Context, planID, trigger string) (err error) {
 	defer func() {
 		if perr := pkgerrors.Recovered(recover()); perr != nil {
-			err = fmt.Errorf("cron: executor panic: %w", perr)
+			err = pkgerrors.Wrapf(perr, "cron: executor panic")
 		}
 	}()
 	return s.exec(ctx, planID, trigger)
+}
+
+// takeoverRetryGuard 是接管重试在租约 TTL 之上的等待余量：租约到期语义
+// （TTL 后可接管）与重试时刻之间留出可见性缓冲。
+const takeoverRetryGuard = 2 * time.Second
+
+// scheduleTakeoverRetry 排一次 TTL 后的接管重试（#239，一次性，不递归）。
+// 重试前查运行台账：本触发点已有非 skip 记录（原持有者正常完成）⇒ 不重跑
+// ——租约「保留到 TTL 到期」的防重设计对崩溃与正常完成一视同仁，盲重试
+// 会把已完成的触发双跑。无法核验（外置台账只写不查）⇒ 保守放弃接管
+// （宁可不接管，不可双跑）。
+//
+// #292：核验面从前只查本进程 MemLedger，而接管场景的常态恰恰是「执行发生
+// 在持有锁的另一个实例上」⇒ 本实例无记录被无条件当作「未执行」，TTL 后
+// 重试必然重跑原持有者已完成的触发点（双跑击穿恰好一次）。现在外置 Ledger
+// 若实现 LedgerQuery（Ran）则据此核验；未实现/查询失败按无法核验保守放弃。
+//
+// 等待走注入时钟（clock.NewTimer 可停 timer，#174 同款，#259）——旧实现裸
+// time.NewTimer 绕过时钟注入，FakeClock 测试下接管重试走真实时间硬等
+// ttl+guard，不可确定性驱动。
+func (s *Scheduler) scheduleTakeoverRetry(ctx context.Context, planID string, at time.Time, ttl time.Duration) {
+	gosafe.Go(func() {
+		timer := s.cfg.clock.NewTimer(ttl + takeoverRetryGuard)
+		defer timer.Stop()
+		select {
+		case <-timer.C():
+		case <-ctx.Done():
+			return
+		}
+		trigger := at.UTC().Format(time.RFC3339)
+		if s.triggerAlreadyRan(ctx, planID, trigger) {
+			s.log.Debug("takeover retry abandoned: trigger already ran or unverifiable",
+				"plan", planID, "trigger", trigger)
+			return
+		}
+		_ = s.fireAttempt(ctx, planID, at, 1)
+	})
+}
+
+// triggerAlreadyRan 报告本触发点是否已有**执行**记录（非 skip），用于接管
+// 重试的防双跑闸（#239/#292）。
+//
+// 判定序：
+//  1. 本进程 MemLedger 有非 skip 记录 ⇒ 已执行（true）；
+//  2. 外置 Ledger 实现 LedgerQuery ⇒ 以 Ran 的结果为准；查询失败返回 true
+//     （无法核验，保守放弃接管）；
+//  3. 外置 Ledger 只写不查（或未注入）⇒ 无法核验，保守返回 true。
+//
+// 第 2/3 步是 #292 的语义修正：此前第 1 步 miss 即无条件返回 false，跨实例
+// 场景下「本实例无记录」是常态，会把原持有者已完成的触发点在 TTL 后重跑。
+func (s *Scheduler) triggerAlreadyRan(ctx context.Context, planID, trigger string) bool {
+	for _, rec := range s.mem.RecentFor(planID) {
+		if rec.Trigger == trigger && !rec.Skipped {
+			return true
+		}
+	}
+	q, ok := s.cfg.ledger.(LedgerQuery)
+	if !ok {
+		return true
+	}
+	ran, err := q.Ran(ctx, planID, trigger)
+	if err != nil {
+		s.log.Error("run ledger query failed, takeover abandoned",
+			"plan", planID, "trigger", trigger, timertask.ErrKey, err)
+		return true
+	}
+	return ran
 }
 
 // recordSkip 记一条「未执行」台账（让位/故障 fail-closed，见 RunRecord）。

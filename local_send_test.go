@@ -46,3 +46,62 @@ func TestLocalBackend_Send_DoesNotMutateCallerTask(t *testing.T) {
 		t.Errorf("调用方 RetryCount 被引擎改写为 %d（#97）", caller.RetryCount)
 	}
 }
+
+// TestLocalBackend_SendRejectedDuringShutdownWindow 钉住 #292：Start 收到停机
+// 信号后，scanLoop 已经退出，但 DrainWorkers 还要等 in-flight worker 到任务
+// 边界（最长 DefaultShutdownDrainGrace）。此前 Send 只检查 st.stopped（Start
+// 返回后才登记）⇒ 窗口内 Send 返回 nil、任务被压进内存堆，而停机路径只排水
+// localQueue、从不处理堆内任务——调用方拿到「提交成功」，任务永久丢失。
+//
+// 修复：stopping 状态与 close(stopChan) 同一临界段登记，窗口内 Send 立即
+// 返回 ErrBackendStopped，任务不入堆。
+func TestLocalBackend_SendRejectedDuringShutdownWindow(t *testing.T) {
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	b := NewLocalBackend(func(ctx context.Context, task *Task) error {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+		<-release // 卡住 in-flight worker，把 Start 停在排水窗口内
+		return nil
+	}, WithWorkers(1))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	startErr := make(chan error, 1)
+	go func() { startErr <- b.Start(ctx) }()
+	defer func() {
+		close(release)
+		select {
+		case <-startErr:
+		case <-time.After(3 * time.Second):
+			t.Error("Start 未返回")
+		}
+	}()
+
+	if err := b.Send(context.Background(), &Task{ID: "inflight", EndTime: time.Now().Unix()}); err != nil {
+		t.Fatalf("Send(inflight): %v", err)
+	}
+	select {
+	case <-entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("handler 未进入（正对照失败）")
+	}
+
+	cancel()
+	// stopChan 关闭 = 停机窗口已进入（stopping 状态在同一临界段登记）：
+	// Start 此时仍阻塞在 DrainWorkers 里、尚未返回。
+	select {
+	case <-b.stopChan:
+	case <-time.After(3 * time.Second):
+		t.Fatal("停机窗口未进入")
+	}
+
+	if err := b.Send(context.Background(), &Task{ID: "late", EndTime: time.Now().Unix()}); !errors.Is(err, ErrBackendStopped) {
+		t.Fatalf("停机窗口内 Send = %v, want ErrBackendStopped（#292：假成功会永久丢任务）", err)
+	}
+	// 被拒绝的任务不得入堆：PendingCount 不能出现「积压但无人消费」的假象。
+	if n, err := b.PendingCount(context.Background()); err != nil || n != 0 {
+		t.Fatalf("PendingCount = %d, %v; want 0（被拒绝的任务不入堆）", n, err)
+	}
+}

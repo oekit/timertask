@@ -3,11 +3,12 @@ package cron
 import (
 	"context"
 	"errors"
-	"fmt"
 	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	pkgerrors "github.com/oekit/pkg/errors"
 
 	"github.com/oekit/timertask/local"
 )
@@ -79,6 +80,8 @@ func execLockKey(planID, trigger string) string {
 //     跨实例仲裁（见 cron_test 的互斥并发场景）。
 //
 // 多实例生产部署请注入分布式实现（redisx/distlock 等，经 Mutex 缝）。
+//
+// 同族骨架见 concurrency keyedTTLRegistry(#363)，跨 module 联动另行评估。
 type LocalMutex struct {
 	clock  local.Clock
 	mu     sync.Mutex
@@ -107,6 +110,11 @@ func NewLocalMutex(clock local.Clock) *LocalMutex {
 // 同键之外的旧租约不会再被触碰，不扫会无界增长；规模 = 触发率 × TTL，
 // 遍历开销可忽略。
 func (m *LocalMutex) TryLock(_ context.Context, key string, ttl time.Duration) (string, error) {
+	// #240：ttl<=0 ⇒ 租约 expires<=now，下一个 TryLock 的惰性清扫立刻把它
+	// 删掉——同键连续两次 TryLock 双双成功，互斥失效。fail-fast 拒绝。
+	if ttl <= 0 {
+		return "", pkgerrors.Newf("timertask: LocalMutex.TryLock ttl must be positive (got %v)", ttl)
+	}
 	now := m.clock.Now()
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -130,10 +138,10 @@ func (m *LocalMutex) Unlock(_ context.Context, key string, ownerID string) error
 	defer m.mu.Unlock()
 	l, ok := m.leases[key]
 	if !ok {
-		return fmt.Errorf("cron: unlock %q: lock not held", key)
+		return pkgerrors.Newf("cron: unlock %q: lock not held", key)
 	}
 	if l.owner != ownerID {
-		return fmt.Errorf("cron: unlock %q: lock held by %q, not %q", key, l.owner, ownerID)
+		return pkgerrors.Newf("cron: unlock %q: lock held by %q, not %q", key, l.owner, ownerID)
 	}
 	delete(m.leases, key)
 	return nil

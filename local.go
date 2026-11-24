@@ -70,14 +70,15 @@ type LocalBackend struct {
 	// 本地队列
 	localQueue chan *Task
 	stopChan   chan struct{}
+	workerWG   sync.WaitGroup // in-flight worker 排空等待(#242)
 	stopOnce   sync.Once
-	// started/stopped 是 Start 的状态机（#124）：started 在 Start 入口登记，
-	// stopped 在停机收尾登记，由 b.mu 保护。stopChan 关闭后没有任何路径重建
-	// 它——若不做状态机，二次 Start 拉起的 goroutine 会全部立刻命中已关闭的
-	// stopChan 退出（哑火），任务照常入堆但零消费，是比 panic 更隐蔽的静默
-	// 失效。状态机让「第二次 Start」要么报错、要么（首次）真的开始消费。
-	started bool
-	stopped bool
+	// st 是 Start 的状态机（#124，检查面单源 timertask.StartState，#262）：
+	// started 在 Start 入口登记，stopped 在停机收尾登记，由 b.mu 保护。
+	// stopChan 关闭后没有任何路径重建它——若不做状态机，二次 Start 拉起的
+	// goroutine 会全部立刻命中已关闭的 stopChan 退出（哑火），任务照常入堆
+	// 但零消费，是比 panic 更隐蔽的静默失效。状态机让「第二次 Start」要么
+	// 报错、要么（首次）真的开始消费。
+	st StartState
 }
 
 // NewLocalBackend 创建基于内存的本地延迟任务后端。
@@ -120,9 +121,10 @@ func NewLocalBackend(handler Handler, opts ...TimerTaskOption) *LocalBackend {
 //   - 不改写调用方的 Task（#97）：CreateTime/MaxRetry 的缺省补齐、worker
 //     重试时对 RetryCount 的推进都落在引擎内部的副本上，调用方提交后继续
 //     读/复用自己的 Task 结构不会看到字段被引擎改写。
-//   - 后端停机后（Start 已返回）⇒ 返回 ErrBackendStopped（#124），任务
-//     不入堆——继续入堆会让 PendingCount 持续增长而永无消费，运维会误判
-//     为队列积压。
+//   - 后端停机后（Start 已返回）或停机进行中（Start 已收到停机信号、消费
+//     循环已退出但排水尚未结束）⇒ 返回 ErrBackendStopped（#124/#292），
+//     任务不入堆——继续入堆会让 PendingCount 持续增长而永无消费，运维会误判
+//     为队列积压；停机窗口的「提交成功」是更隐蔽的永久丢失。
 func (b *LocalBackend) Send(ctx context.Context, task *Task) error {
 	if task.ID == "" {
 		return ErrEmptyTaskID
@@ -141,7 +143,7 @@ func (b *LocalBackend) Send(ctx context.Context, task *Task) error {
 	defer b.mu.Unlock()
 
 	// #124：停机后拒绝新任务（见 Send 注释的任务不入堆条目）。
-	if b.stopped {
+	if b.st.StoppedLocked() {
 		return ErrBackendStopped
 	}
 
@@ -176,37 +178,55 @@ func (b *LocalBackend) Send(ctx context.Context, task *Task) error {
 // started 错误），不会像旧实现那样拉起一组因 stopChan 已关闭而立刻退出的
 // 哑火 goroutine。需要重启任务消费请重建实例。
 func (b *LocalBackend) Start(ctx context.Context) error {
-	// #124 状态机：入口先做状态检查并登记 started（与 Send/PendingCount 共用
-	// b.mu）。检查必须在拉起 goroutine 之前，否则二次调用同样会拉起一组必然
-	// 哑火的消费者。
+	// #124 状态机：入口先做状态检查并登记 started（三态检查单源
+	// timertask.StartState.BeginStartLocked，#262；与 Send/PendingCount 共用
+	// b.mu）。检查必须在拉起 goroutine 之前，否则二次调用同样会拉起一组
+	// 必然哑火的消费者。
 	b.mu.Lock()
-	if b.stopped {
+	if err := b.st.BeginStartLocked(); err != nil {
 		b.mu.Unlock()
-		return ErrBackendStopped
+		return err
 	}
-	if b.started {
-		b.mu.Unlock()
-		return ErrBackendAlreadyStarted
-	}
-	b.started = true
 	b.mu.Unlock()
 
 	// 启动扫描器
 	gosafe.Go(func() { b.scanLoop(ctx) })
 
 	// 启动本地 Worker 池
+	b.workerWG.Add(b.workers)
 	for range b.workers {
-		gosafe.Go(func() { b.workerLoop(ctx) })
+		wg := &b.workerWG
+		gosafe.Go(func() {
+			defer wg.Done()
+			b.workerLoop(ctx)
+		})
 	}
 
 	<-ctx.Done()
 	// stopOnce 防二次 Start 后重复 close panic(2026-09-06 复审加固);
 	// Local 侧任务为 at-most-once:localQueue 阻塞中遇停机的任务直接丢弃、
 	// 无回灌(与 Redis 侧 doc 声明的语义对齐,进程存活期内不丢已执行任务)
-	b.stopOnce.Do(func() { close(b.stopChan) })
+	//
+	// #292：stopping 状态与 close(stopChan) 同一临界段登记。scanLoop 在
+	// stopChan 关闭后退出，但 DrainWorkers 还要等 in-flight worker（最长
+	// DefaultShutdownDrainGrace=10s）；窗口内 Send 若仍只检查 st.stopped
+	// （Start 返回后才置位）会返回 nil 并把任务压进内存堆——停机路径只排水
+	// localQueue，从不处理堆内任务 ⇒ 调用方拿到「提交成功」、任务永久丢失、
+	// PendingCount 却持续显示积压。登记 stopping 后 Send 走既有
+	// ErrBackendStopped 拒绝路径，窗口内不再有假成功。
+	b.stopOnce.Do(func() {
+		b.mu.Lock()
+		b.st.MarkStoppingLocked()
+		close(b.stopChan)
+		b.mu.Unlock()
+	})
+	// #242：等 in-flight worker 到任务边界（有界宽限）——at-most-once 语义
+	// 不回灌，但正在执行的任务让它跑完当前这一次（进程随后退出，半途强杀
+	// 由调用方决定）。排水骨架单源 timertask.DrainWorkers（#262）。
+	DrainWorkers(&b.workerWG, DefaultShutdownDrainGrace)
 	// #124：登记停机——此后的二次 Start / Send 都显式报错（ErrBackendStopped）。
 	b.mu.Lock()
-	b.stopped = true
+	b.st.MarkStoppedLocked()
 	b.mu.Unlock()
 	return ctx.Err()
 }

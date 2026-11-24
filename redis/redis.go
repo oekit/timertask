@@ -12,11 +12,21 @@ import (
 
 	"github.com/oekit/concurrency/async"
 	"github.com/oekit/logx"
+	pkgerrors "github.com/oekit/pkg/errors"
 	"github.com/oekit/timertask"
 	goredis "github.com/redis/go-redis/v9"
 )
 
 const (
+	// ⚠️ 键空间（#292）：所有键共用同一个 hash tag `{timertask.<buzType>}`，
+	// WithBuckets 只是**单 slot 内的逻辑分片**（锁/扫描/本地队列粒度），
+	// 不提供 Redis Cluster 跨节点扩展——同 buzType 的 shard ZSet、processing
+	// 租约、retry_count hash、dead 死信、heartbeat 全落同一 slot。
+	//
+	// 把 hash tag 下沉到分片粒度 `{timertask.<buzType>.shard.N}` 需要
+	// processing/retry_count/dead 一并按分片拆分（Lua 原子脚本要求同 slot），
+	// 是键空间 breaking 变更：旧键对新版本不可见，升级前必须 flush 旧键。
+	// 该变更登记在后续 breaking 窗口，本版本不做静默切换（见包文档）。
 	taskKeyPattern = "{timertask.%s}.shard.%d"
 	heartbeatKey   = "{timertask.%s}.heartbeat"
 	deadLetterKey  = "{timertask.%s}.dead"
@@ -104,13 +114,21 @@ type RedisBackend struct {
 	localQueue chan *claim
 	stopChan   chan struct{}
 	stopOnce   sync.Once
-	// started/stopped 是 Start 的状态机（#124），语义与 LocalBackend 一致，
-	// 由 mu 保护：stopChan 关闭后不重建，不做状态机的话二次 Start 会拉起一组
-	// 立刻哑火的消费者（本实例消费吞吐静默归零），Start 却阻塞在新 ctx 上
-	// 看起来健康。状态机让「第二次 Start」要么报错、要么（首次）真的开始消费。
-	mu      sync.Mutex
-	started bool
-	stopped bool
+	workerWG   sync.WaitGroup // in-flight worker 排空等待(#242)
+	// consumeWG 等 consumeRemoteLoop 退出（#292）：停机序必须是
+	// close(stopChan) → join 消费者 → 排水 worker → 回灌 localQueue。
+	// 此前 Start 只等 workerWG，消费者可能在本轮 claim 已从 ZSet 原子删除后
+	// 才走到入队 select（localQueue 与已关闭 stopChan 同时就绪时 Go select
+	// 随机选）——回灌排水结束后迟到入队的 claim 留在 localQueue 里无人消费，
+	// at-most-once 永久丢任务、at-least-once 白等一个 visibilityTimeout。
+	consumeWG sync.WaitGroup
+	// st 是 Start 的状态机（#124），语义与 LocalBackend 一致，检查面单源
+	// timertask.StartState（#262），由 mu 保护：stopChan 关闭后不重建，不做
+	// 状态机的话二次 Start 会拉起一组立刻哑火的消费者（本实例消费吞吐静默
+	// 归零），Start 却阻塞在新 ctx 上看起来健康。状态机让「第二次 Start」
+	// 要么报错、要么（首次）真的开始消费。
+	mu sync.Mutex
+	st timertask.StartState
 }
 
 // claim 是本地队列中的已 claim 任务，member 为 ZSet 原始成员串。
@@ -142,8 +160,9 @@ func NewRedisBackend(buzType string, client goredis.UniversalClient, handler tim
 		stopChan:          make(chan struct{}),
 	}
 
-	// 创建分片管理器
-	b.shardManager = NewShardManager(buzType, client, b.buckets)
+	// 创建分片管理器（#260：WithClock 经同一配置面下发到分片面——心跳
+	// 时间戳与过期清理阈值与任务时间判断同源走注入时钟）
+	b.shardManager = NewShardManager(buzType, client, b.buckets, WithShardClock(cfg.Clock))
 
 	return b
 }
@@ -177,14 +196,15 @@ func (b *RedisBackend) Send(ctx context.Context, task *timertask.Task) error {
 		return timertask.ErrEmptyTaskID
 	}
 	b.mu.Lock()
-	stopped := b.stopped
+	stopped := b.st.StoppedLocked()
 	b.mu.Unlock()
 	if stopped {
 		return timertask.ErrBackendStopped
 	}
 	// 规范化 member 单源 canonicalMember（#188）：补 MaxRetry 缺省、钉
-	// CreateTime=EndTime（#75）、RetryCount 归零（#188）——Send 与租约回投
-	// 两条写入面共用同一产出，「同拍重发 = 同 member」自此跨租约周期成立。
+	// CreateTime=EndTime（#75）、RetryCount 归零（#188）——Send 与两条回投
+	// 路径（reapExpiredLeases / requeueClaim）共用同一产出，「同拍重发 =
+	// 同 member」自此跨租约周期成立。
 	data, err := b.canonicalMember(task)
 	if err != nil {
 		return err
@@ -196,7 +216,7 @@ func (b *RedisBackend) Send(ctx context.Context, task *timertask.Task) error {
 		Member: string(data),
 	}).Result()
 	if err != nil {
-		return fmt.Errorf("timertask: ZADD %s: %w", key, err)
+		return pkgerrors.Wrapf(err, "timertask: ZADD %s", key)
 	}
 	log.Info("task scheduled", "taskID", task.ID, "endTime", task.EndTime)
 	return nil
@@ -227,7 +247,7 @@ func (b *RedisBackend) Remove(ctx context.Context, taskID string, endTS int64) (
 		Max: strconv.FormatInt(endTS, 10),
 	}).Result()
 	if err != nil {
-		return 0, fmt.Errorf("timertask: ZRANGEBYSCORE %s: %w", key, err)
+		return 0, pkgerrors.Wrapf(err, "timertask: ZRANGEBYSCORE %s", key)
 	}
 	var removed int64
 	for _, m := range members {
@@ -237,7 +257,7 @@ func (b *RedisBackend) Remove(ctx context.Context, taskID string, endTS int64) (
 		}
 		n, err := b.client.ZRem(ctx, key, m).Result()
 		if err != nil {
-			return removed, fmt.Errorf("timertask: ZREM %s: %w", key, err)
+			return removed, pkgerrors.Wrapf(err, "timertask: ZREM %s", key)
 		}
 		removed += n
 	}
@@ -255,19 +275,15 @@ func (b *RedisBackend) Remove(ctx context.Context, taskID string, endTS int64) (
 // already started 错误），不会像旧实现那样拉起一组因 stopChan 已关闭而
 // 立刻退出的哑火 goroutine。需要重启任务消费请重建实例。
 func (b *RedisBackend) Start(ctx context.Context) error {
-	// #124 状态机：入口先做状态检查并登记 started。检查必须在拉起 goroutine
+	// #124 状态机：入口先做状态检查并登记 started（三态检查单源
+	// timertask.StartState.BeginStartLocked，#262）。检查必须在拉起 goroutine
 	// 之前，否则二次调用同样会拉起一组必然哑火的消费者。
 	b.mu.Lock()
-	if b.stopped {
-		b.mu.Unlock()
-		return timertask.ErrBackendStopped
-	}
-	if b.started {
-		b.mu.Unlock()
+	if err := b.st.BeginStartLocked(); err != nil {
 		// already-started 哨兵单源（#169）：根包导出的 timertask.ErrBackendAlreadyStarted。
-		return timertask.ErrBackendAlreadyStarted
+		b.mu.Unlock()
+		return err
 	}
-	b.started = true
 	b.mu.Unlock()
 
 	// 启动心跳
@@ -277,7 +293,11 @@ func (b *RedisBackend) Start(ctx context.Context) error {
 	async.GoSafe(func() { b.shardManager.StartAssign(ctx) })
 
 	// 启动远程队列消费
-	async.GoSafe(func() { b.consumeRemoteLoop(ctx) })
+	b.consumeWG.Add(1)
+	async.GoSafe(func() {
+		defer b.consumeWG.Done()
+		b.consumeRemoteLoop(ctx)
+	})
 
 	// at-least-once：启动租约回扫——崩溃实例未 Ack 的租约到期后由本循环捡回重投
 	if b.delivery == timertask.DeliveryAtLeastOnce {
@@ -285,8 +305,13 @@ func (b *RedisBackend) Start(ctx context.Context) error {
 	}
 
 	// 启动本地 Worker 池
+	b.workerWG.Add(b.workers)
 	for range b.workers {
-		async.GoSafe(func() { b.workerLoop(ctx) })
+		wg := &b.workerWG
+		async.GoSafe(func() {
+			defer wg.Done()
+			b.workerLoop(ctx)
+		})
 	}
 
 	<-ctx.Done()
@@ -295,6 +320,30 @@ func (b *RedisBackend) Start(ctx context.Context) error {
 	// 失败、重试全败，从未真正处理的任务被写进死信 ZSet（假死信）。
 	// stopOnce 防二次 Start 重复 close panic（与 LocalBackend 对称）。
 	b.stopOnce.Do(func() { close(b.stopChan) })
+	// #292：先 join 消费循环再排水/回灌。consumeRemoteOnce 可能在 claim
+	// （deleteScript 已原子删除分片 / claimLeaseScript 已移入租约集）之后才
+	// 走到入队 select——localQueue 有空间时它与已关闭的 stopChan 同时就绪，
+	// Go select 随机选 localQueue ⇒ 迟到入队。旧序（只等 workerWG 就
+	// 回灌）下这份 claim 会落在「回灌已排水完」的 localQueue 里无人再处理：
+	// at-most-once 永久丢失、at-least-once 白等一个 visibilityTimeout。
+	// join 保证所有入队/回灌动作都发生在排水之前。
+	//
+	// join 有界（与 worker 排水共用 DefaultShutdownDrainGrace）：Redis 黑洞
+	// （网络分区而非拒连）下消费者可能卡在客户端 ReadTimeout，无界 join 会
+	// 把 Start 退出路径挂死；超窗记警告并按原 at-most-once 语义收尾。
+	if !timertask.DrainWorkers(&b.consumeWG, timertask.DefaultShutdownDrainGrace) {
+		log.Warn("consumer join grace exceeded on shutdown, late claims may be dropped (at-most-once)",
+			"grace", timertask.DefaultShutdownDrainGrace)
+	}
+	// #242：等 in-flight worker 到达任务边界（有界宽限）——此前直接回灌，
+	// 正在执行的任务的租约同时被回灌面处理，执行与回灌赛跑：完成前回灌
+	// ⇒ 重启后双跑；完成后的 ack 与回灌竞态。宽限期内 worker 在任务边界
+	// 退出（stopChan 已关），宽限超时仍不退出的按原路径处理（进程退出，
+	// 租约由 TTL 兜底）。排水骨架单源 timertask.DrainWorkers（#262），
+	// 宽限预算单源 timertask.DefaultShutdownDrainGrace。
+	if !timertask.DrainWorkers(&b.workerWG, timertask.DefaultShutdownDrainGrace) {
+		log.Warn("worker drain grace exceeded on shutdown, proceeding with requeue", "grace", timertask.DefaultShutdownDrainGrace)
+	}
 	b.requeuePendingOnShutdown()
 	// at-least-once：停机同步补一轮租约回扫（reapLoop 内也会做，这里兜底时序竞态）
 	if b.delivery == timertask.DeliveryAtLeastOnce {
@@ -303,7 +352,7 @@ func (b *RedisBackend) Start(ctx context.Context) error {
 	// #124：停机收尾完成后登记 stopped——此后的二次 Start / Send 都显式报错
 	// （timertask.ErrBackendStopped）。
 	b.mu.Lock()
-	b.stopped = true
+	b.st.MarkStoppedLocked()
 	b.mu.Unlock()
 	return ctx.Err()
 }
@@ -364,7 +413,13 @@ func (b *RedisBackend) requeuePendingOnShutdown() {
 // at-most-once 只有回投单命令，无半失败窗口。
 func (b *RedisBackend) requeueClaim(ctx context.Context, c *claim) bool {
 	task := c.task
-	data, err := json.Marshal(task)
+	// 回投 member 单源 canonicalMember（#279）：c.task 指针在中断路径可能已被
+	// 改写（retry-count hash 基线回写 redis.go:642-644、RunWithRetry 重试推进
+	// retry.go:99），裸 json.Marshal 会产出与 Send 分叉的字节串——at-most-once
+	// 下 ZAdd 变新增条目而非 score 更新，同拍幂等重发即双 member 双跑
+	// （#76/#188 不变量在第三写入面失效）。canonicalMember 对已 canonical
+	// 的 task 幂等，无行为变化。
+	data, err := b.canonicalMember(task)
 	if err != nil {
 		log.Error("requeue marshal failed", "taskID", task.ID, logx.ErrKey, err)
 		return false
@@ -373,7 +428,7 @@ func (b *RedisBackend) requeueClaim(ctx context.Context, c *claim) bool {
 	if b.delivery != timertask.DeliveryAtLeastOnce {
 		if err := b.client.ZAdd(ctx, key, goredis.Z{
 			Score:  float64(task.EndTime),
-			Member: string(data),
+			Member: data,
 		}).Err(); err != nil {
 			log.Error("requeue ZAdd failed", "taskID", task.ID, logx.ErrKey, err)
 			return false
@@ -381,7 +436,7 @@ func (b *RedisBackend) requeueClaim(ctx context.Context, c *claim) bool {
 		return true
 	}
 	if err := requeueLeaseScript.Run(ctx, b.client, []string{key, b.processingKey()},
-		task.EndTime, string(data), c.member).Err(); err != nil {
+		task.EndTime, data, c.member).Err(); err != nil {
 		log.Error("requeue failed", "taskID", task.ID, logx.ErrKey, err)
 		return false
 	}
@@ -800,9 +855,10 @@ func (b *RedisBackend) parseTask(data string) *timertask.Task {
 //   - CreateTime 钉为 EndTime（#75，member 里「创建时刻」不存在）；
 //   - RetryCount 归零（#188）——真实重试计数在 retry-count hash
 //     （redis_reliable.go），member 必须在任务整个生命周期内字节稳定：
-//     Send 与租约到期回投（reapExpiredLeases）两条写入面共用本函数，
-//     「同拍重发 = 同 member」与「回投 member = Send member」自此同一字节串，
-//     生产者 at-least-once 重发命中 ZAdd 的 score 更新而非新增条目。
+//     Send、租约到期回投（reapExpiredLeases）与停机回投（requeueClaim，
+//     #279）三条写入面共用本函数，「同拍重发 = 同 member」与「回投 member =
+//     Send member」自此同一字节串，生产者 at-least-once 重发命中 ZAdd 的
+//     score 更新而非新增条目。
 //
 // 历史格式 member（含非零 retry_count 的旧版本写入）解析不受影响；升级窗口
 // 内「旧 member 未消费 + 新 member 重发」会短暂并存两条（重发与旧条目字节
@@ -817,7 +873,7 @@ func (b *RedisBackend) canonicalMember(t *timertask.Task) (string, error) {
 	c.RetryCount = 0
 	data, err := json.Marshal(&c)
 	if err != nil {
-		return "", fmt.Errorf("timertask: marshal task: %w", err)
+		return "", pkgerrors.Wrapf(err, "timertask: marshal task")
 	}
 	return string(data), nil
 }
@@ -828,7 +884,7 @@ func (b *RedisBackend) PendingCount(ctx context.Context) (int64, error) {
 	for i := range b.buckets {
 		count, err := b.client.ZCard(ctx, b.shardKey(i)).Result()
 		if err != nil {
-			return total, fmt.Errorf("pending count shard %d: %w", i, err)
+			return total, pkgerrors.Wrapf(err, "pending count shard %d", i)
 		}
 		total += count
 	}
@@ -847,6 +903,11 @@ func (b *RedisBackend) taskKey(taskID string) string {
 		// 直接写 `int(crc32.ChecksumIEEE(...)) % b.buckets` 在 32 位平台上
 		// 会按位截断成负数 ⇒ 任务被写进 `{timertask.x}.shard.-3` 这样的 key，
 		// 而消费/回扫只扫 shard.0 … shard.N-1 ⇒ 任务永远不会被执行，也不进死信。
+		//
+		// 放置哈希与 redis/shard.go 的客户端分配哈希刻意不同函数（#285）：
+		// 此处 crc32 按任务 ID 决定任务落进哪个分片键（数据面路由），那边
+		// FNV-1a 按分片标识把分片派给在线实例（归属面分配）——用途不同、
+		// 不要求同哈希。改动任一前先读另一处，勿使任务放置与实例分配视图漂移。
 		shard = shardIndex(crc32.ChecksumIEEE([]byte(taskID)), b.buckets)
 	}
 	return fmt.Sprintf(taskKeyPattern, b.buzType, shard)

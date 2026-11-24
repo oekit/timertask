@@ -3,11 +3,14 @@ package local
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 
+	pkgerrors "github.com/oekit/pkg/errors"
 	"github.com/oekit/pkg/timex/cron"
 
 	"github.com/oekit/timertask/internal/gosafe"
+	"github.com/oekit/timertask/internal/reconcile"
 )
 
 // Entry 是业务键形态的期望条目（Reconcile 的输入，#129）。
@@ -19,7 +22,27 @@ import (
 type Entry struct {
 	Key  string
 	Spec string
-	Task Task
+	// Fingerprint 是变更指纹（#261，diff 单元下沉 cron 同款语义）：
+	//
+	//   - 留空（缺省）⇒ 派生指纹 = Spec，diff 只看表达式——与历史行为
+	//     逐字节兼容；
+	//   - 非空 ⇒ diff 看（Spec, Fingerprint）二元组：spec 未变而指纹变化
+	//     也按「被编辑过」重装（从新基准起算，zeus taskFingerprint 语义）。
+	//
+	// 注意指纹构成是调用方的契约选择：含 updatedAt 时「改任务元数据」
+	// 也会重装、@every 触发基准随之重置（刻意语义——编辑过就该从新基准
+	// 起算）；只想「行为变更才重装」就把指纹定为 表达式+状态 的哈希。
+	Fingerprint string
+	Task        Task
+}
+
+// deriveFingerprint 返回条目的 diff 指纹（留空派生 = Spec，见 Entry.Fingerprint
+// 与 InstallFor 的指纹参数）。
+func deriveFingerprint(spec, fingerprint string) string {
+	if fingerprint != "" {
+		return fingerprint
+	}
+	return spec
 }
 
 // ScheduleFor 按业务键 upsert 一个 cron 任务（#129）。
@@ -41,6 +64,12 @@ type Entry struct {
 //     触发（正在执行的旧任务不打断，与 Unschedule 语义一致），新表达式从
 //     注册时刻起算。
 //
+// 本函数等价 InstallFor(key, spec, "", fn)——diff 只看表达式（缺省指纹）。
+// 需要「spec 未变而指纹变化也重装」的指纹语义（调度平台/动态装配形态，
+// zeus taskFingerprint 同款）请用 InstallFor 或 Reconcile 的
+// Entry.Fingerprint（#261：指纹 diff 单源下沉本调度器，消费方无须自持
+// 登记簿镜像、无须「先摘后装」的 forced hack）。
+//
 // Task 与 Reconcile 同口径（#155）：仅在「需要安装/重装」时使用，spec 未变
 // 的幂等空操作忽略 Task（fn 为 nil 亦放行，任务函数以首次注册为准）——纯
 // 表达式 upsert（ScheduleFor(key, spec, nil)）由此可用；需要安装/重装而
@@ -51,20 +80,37 @@ type Entry struct {
 // 前请确认这正是想要的。
 //
 // spec 解析失败 / 语法合法但永无触发点（ErrUnsatisfiableSpec）/ 调度器已
-// 停止时返回错误，此时该 key 的既有注册不受影响。Start 之前调用亦可：
-// 条目先入表，Start 时随全部条目一起启动。
+// 停止时返回错误，此时该 key 的既有注册不受影响（校验先于任何变更，不存在
+// 「摘了装不上」的中间态）。Start 之前调用亦可：条目先入表，Start 时随全部
+// 条目一起启动。
 func (s *Scheduler) ScheduleFor(key, spec string, fn Task) error {
+	return s.InstallFor(key, spec, "", fn)
+}
+
+// InstallFor 是 ScheduleFor 的指纹感知安装原语（#261）：按（Spec, 派生指纹）
+// 二元组做 diff——指纹未变幂等空操作（不重装、不重置触发基准），spec 或
+// 指纹任一变化摘旧装新。fingerprint 留空派生 = spec（与 Entry.Fingerprint
+// 同口径）：InstallFor(key, spec, "", fn) 即 ScheduleFor。
+//
+// 重装是**先校验后原子换装**：spec 解析/可满足性校验全部通过才动注册表，
+// 失败路径的既有注册不受影响——不存在旧实现的「先摘后装、摘了装不上」
+// 中间态（cron.Scheduler 的 forced hack 与手动回滚由本语义取代）。
+//
+// 其余语义（幂等防呆 / nil Task 口径 / 错误面 / Start 前调用）与
+// ScheduleFor 一致，见其注释。
+func (s *Scheduler) InstallFor(key, spec, fingerprint string, fn Task) error {
 	if key == "" {
 		return errors.New("local: empty key")
 	}
 	sched, err := s.parseSpec(spec)
 	if err != nil {
-		return fmt.Errorf("local: parse cron %q: %w", spec, err)
+		return pkgerrors.Wrapf(err, "local: parse cron %q", spec)
 	}
 	// 与 Schedule 同一口径（#123）：试算首个触发点，求不出即报错。
 	if err := s.checkSatisfiable(sched); err != nil {
 		return fmt.Errorf("%w: %q", err, spec)
 	}
+	fp := deriveFingerprint(spec, fingerprint)
 
 	s.mu.Lock()
 	if s.stopped {
@@ -72,8 +118,8 @@ func (s *Scheduler) ScheduleFor(key, spec string, fn Task) error {
 		return ErrSchedulerStopped
 	}
 	old := s.keyed[key]
-	if old != nil && old.spec == spec {
-		// 指纹（spec）未变：幂等空操作（防 @every 重置，见函数注释）。
+	if old != nil && old.spec == spec && old.fingerprint == fp {
+		// 指纹未变：幂等空操作（防 @every 重置，见 ScheduleFor 注释）。
 		// Task 此时被忽略（nil 亦然，#155——与 Reconcile 的 unchanged 分支
 		// 同口径）。
 		s.mu.Unlock()
@@ -90,11 +136,12 @@ func (s *Scheduler) ScheduleFor(key, spec string, fn Task) error {
 		delete(s.keyed, key)
 	}
 	e := &entry{
-		spec:     spec,
-		schedule: sched,
-		task:     fn,
-		key:      key,
-		lastFire: s.clock.Now(),
+		spec:        spec,
+		schedule:    sched,
+		task:        fn,
+		key:         key,
+		fingerprint: fp,
+		lastFire:    s.clock.Now(),
 	}
 	e.cond = sync.NewCond(&e.mu)
 	s.keyed[key] = e
@@ -112,6 +159,22 @@ func (s *Scheduler) ScheduleFor(key, spec string, fn Task) error {
 	}
 	s.notify()
 	return nil
+}
+
+// InstalledKeys 返回当前已注册业务键形态条目的全部 key（排序后返回，消费方
+// 断言/收敛可确定）。#261：动态装配面（cron.Scheduler）据此做「已装但不在
+// 期望集」的注销收敛——登记簿单源本调度器，消费方无须自持一份镜像登记簿
+// （双份登记簿对同一概念状态各持一面，diff 规则一旦分叉就出现「指纹变了
+// 摘不下来」的漂移）。不含 spec 键形态的条目（两形态并存不互通）。
+func (s *Scheduler) InstalledKeys() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	keys := make([]string, 0, len(s.keyed))
+	for k := range s.keyed {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+	return keys
 }
 
 // UnscheduleFor 按业务键注销一个 cron 任务，返回是否确实移除了该任务。
@@ -144,29 +207,32 @@ func (s *Scheduler) UnscheduleFor(key string) bool {
 //   - 单条 spec 解析失败 / 不可满足**不阻断**其余条目的收敛（一个坏任务
 //     不应阻止其余任务对账），失败逐条汇总进返回错误（errors.Join）；
 //   - 期望集内 key 重复 ⇒ 「以哪条为准」存在歧义，fail-closed：本次调用
-//     不做任何变更并返回错误；
+//     不做任何变更并返回错误（校验块单源 internal/reconcile.ValidateDesiredSet，
+//     #261——与 cron.Reconcile 同一块判定）；
 //   - 收敛原子：期间并发的 ScheduleFor/UnscheduleFor 不会看到中间态
 //     （全部变更在单次持锁内完成）。
 //
 // errors 全部成功时返回 nil；调用方通常应串行化对账（单 goroutine 周期
 // 触发），与多实例并发对账同一期望集是安全的（收敛结果一致）。
 func (s *Scheduler) Reconcile(entries []Entry) error {
-	seen := make(map[string]bool, len(entries))
+	ids := make([]string, len(entries))
 	for i := range entries {
-		if entries[i].Key == "" {
-			return errors.New("local: reconcile: empty key in desired set")
-		}
-		if seen[entries[i].Key] {
-			return fmt.Errorf("local: reconcile: duplicate key %q in desired set", entries[i].Key)
-		}
-		seen[entries[i].Key] = true
+		ids[i] = entries[i].Key
+	}
+	if err := reconcile.ValidateDesiredSet("local", "key", ids); err != nil {
+		return err
+	}
+	seen := make(map[string]bool, len(entries))
+	for _, id := range ids {
+		seen[id] = true
 	}
 
-	// 锁外解析期望集里的 spec：只解析「需要安装/重装」的条目——spec 未变
+	// 锁外解析期望集里的 spec：只解析「需要安装/重装」的条目——指纹未变
 	// 的条目是幂等空操作，注册时已校验过，无须重验。
 	type install struct {
 		key   string
 		spec  string
+		fp    string
 		fn    Task
 		sched cron.Schedule
 	}
@@ -174,27 +240,28 @@ func (s *Scheduler) Reconcile(entries []Entry) error {
 	var errs []error
 	for i := range entries {
 		en := entries[i]
+		fp := deriveFingerprint(en.Spec, en.Fingerprint)
 		s.mu.Lock()
 		cur := s.keyed[en.Key]
-		unchanged := cur != nil && cur.spec == en.Spec
+		unchanged := cur != nil && cur.spec == en.Spec && cur.fingerprint == fp
 		s.mu.Unlock()
 		if unchanged {
 			continue
 		}
 		if en.Task == nil {
-			errs = append(errs, fmt.Errorf("local: reconcile %q: %w", en.Key, ErrNilTask))
+			errs = append(errs, pkgerrors.Wrapf(ErrNilTask, "local: reconcile %q", en.Key))
 			continue
 		}
 		sched, err := s.parseSpec(en.Spec)
 		if err != nil {
-			errs = append(errs, fmt.Errorf("local: reconcile %q: parse cron %q: %w", en.Key, en.Spec, err))
+			errs = append(errs, pkgerrors.Wrapf(err, "local: reconcile %q: parse cron %q", en.Key, en.Spec))
 			continue
 		}
 		if err := s.checkSatisfiable(sched); err != nil {
 			errs = append(errs, fmt.Errorf("%w: reconcile %q: %q", err, en.Key, en.Spec))
 			continue
 		}
-		installs = append(installs, install{key: en.Key, spec: en.Spec, fn: en.Task, sched: sched})
+		installs = append(installs, install{key: en.Key, spec: en.Spec, fp: fp, fn: en.Task, sched: sched})
 	}
 
 	// 单次持锁内完成全部 upsert 与移除：收敛原子，等待者看不到中间态。
@@ -209,19 +276,20 @@ func (s *Scheduler) Reconcile(entries []Entry) error {
 	news := make([]*entry, 0, len(installs))
 	for _, in := range installs {
 		old := s.keyed[in.key]
-		if old != nil && old.spec == in.spec {
-			continue // 锁内复核：并发方已装上同 spec ⇒ 幂等空操作
+		if old != nil && old.spec == in.spec && old.fingerprint == in.fp {
+			continue // 锁内复核：并发方已装上同指纹 ⇒ 幂等空操作
 		}
 		if old != nil {
 			delete(s.keyed, in.key)
 			closeOlds = append(closeOlds, old)
 		}
 		e := &entry{
-			spec:     in.spec,
-			schedule: in.sched,
-			task:     in.fn,
-			key:      in.key,
-			lastFire: s.clock.Now(),
+			spec:        in.spec,
+			schedule:    in.sched,
+			task:        in.fn,
+			key:         in.key,
+			fingerprint: in.fp,
+			lastFire:    s.clock.Now(),
 		}
 		e.cond = sync.NewCond(&e.mu)
 		s.keyed[in.key] = e
